@@ -1,0 +1,393 @@
+{
+  "info": {
+    "_postman_id": "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
+    "name": "Arvan SMS API",
+    "description": "All API cases for Arvan modular monolith.\n\nSetup:\n1. Create a user in DB (see README seed).\n2. Set `baseUrl` and `userId`.\n3. Run Users → Add Balance first.",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+  },
+  "variable": [
+    { "key": "baseUrl", "value": "http://localhost:8080" },
+    { "key": "userId", "value": "1" },
+    { "key": "idempotencyKey", "value": "abc-123" },
+    { "key": "requestId", "value": "1" }
+  ],
+  "item": [
+    {
+      "name": "Health",
+      "item": [
+        {
+          "name": "Health check",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": "{{baseUrl}}/health"
+          }
+        }
+      ]
+    },
+    {
+      "name": "Users",
+      "item": [
+        {
+          "name": "Get user - success",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": "{{baseUrl}}/users/{{userId}}"
+          }
+        },
+        {
+          "name": "Get user - not found",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": "{{baseUrl}}/users/999999"
+          }
+        },
+        {
+          "name": "Get user - invalid id",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": "{{baseUrl}}/users/abc"
+          }
+        },
+        {
+          "name": "Add balance - success",
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"amount\": 10000\n}"
+            },
+            "url": "{{baseUrl}}/users/{{userId}}/add-balance"
+          }
+        },
+        {
+          "name": "Add balance - validation (amount <= 0)",
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"amount\": 0\n}"
+            },
+            "url": "{{baseUrl}}/users/{{userId}}/add-balance"
+          }
+        },
+        {
+          "name": "Add balance - user not found",
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"amount\": 1000\n}"
+            },
+            "url": "{{baseUrl}}/users/999999/add-balance"
+          }
+        }
+      ]
+    },
+    {
+      "name": "Messages - Send",
+      "item": [
+        {
+          "name": "Send - OTP + text (happy path)",
+          "event": [
+            {
+              "listen": "prerequest",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.collectionVariables.set('idempotencyKey', 'send-' + Date.now());"
+                ]
+              }
+            },
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "const json = pm.response.json();",
+                  "if (json && json.data && json.data.requestId) {",
+                  "  pm.collectionVariables.set('requestId', String(json.data.requestId));",
+                  "}"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"userId\": \"{{userId}}\",\n  \"idempotencyKey\": \"{{idempotencyKey}}\",\n  \"otpMessages\": [\n    {\n      \"type\": \"express\",\n      \"template\": \"Hi {{name}}, amount {{amount}}\",\n      \"recipients\": [\n        {\n          \"mobile\": \"09121234567\",\n          \"variables\": {\n            \"name\": \"Soheil\",\n            \"amount\": \"2000\"\n          }\n        }\n      ]\n    }\n  ],\n  \"textMessages\": [\n    {\n      \"type\": \"normal\",\n      \"text\": \"Hello\",\n      \"recipients\": [\n        \"09121234567\",\n        \"09351234567\"\n      ]\n    }\n  ]\n}"
+            },
+            "url": "{{baseUrl}}/messages/send"
+          }
+        },
+        {
+          "name": "Send - OTP only",
+          "event": [
+            {
+              "listen": "prerequest",
+              "script": {
+                "type": "text/javascript",
+                "exec": ["pm.collectionVariables.set('idempotencyKey', 'otp-' + Date.now());"]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"userId\": \"{{userId}}\",\n  \"idempotencyKey\": \"{{idempotencyKey}}\",\n  \"otpMessages\": [\n    {\n      \"type\": \"express\",\n      \"template\": \"code is {{code}}\",\n      \"recipients\": [\n        {\n          \"mobile\": \"09121234567\",\n          \"variables\": { \"code\": \"123456\" }\n        }\n      ]\n    }\n  ],\n  \"textMessages\": []\n}"
+            },
+            "url": "{{baseUrl}}/messages/send"
+          }
+        },
+        {
+          "name": "Send - text express only",
+          "event": [
+            {
+              "listen": "prerequest",
+              "script": {
+                "type": "text/javascript",
+                "exec": ["pm.collectionVariables.set('idempotencyKey', 'text-' + Date.now());"]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"userId\": \"{{userId}}\",\n  \"idempotencyKey\": \"{{idempotencyKey}}\",\n  \"otpMessages\": [],\n  \"textMessages\": [\n    {\n      \"type\": \"express\",\n      \"text\": \"Urgent hello\",\n      \"recipients\": [\"09121234567\"]\n    }\n  ]\n}"
+            },
+            "url": "{{baseUrl}}/messages/send"
+          }
+        },
+        {
+          "name": "Send - mixed accepted + rejected mobile",
+          "event": [
+            {
+              "listen": "prerequest",
+              "script": {
+                "type": "text/javascript",
+                "exec": ["pm.collectionVariables.set('idempotencyKey', 'reject-' + Date.now());"]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"userId\": \"{{userId}}\",\n  \"idempotencyKey\": \"{{idempotencyKey}}\",\n  \"otpMessages\": [],\n  \"textMessages\": [\n    {\n      \"type\": \"normal\",\n      \"text\": \"Hello\",\n      \"recipients\": [\"09121234567\", \"bad\"]\n    }\n  ]\n}"
+            },
+            "url": "{{baseUrl}}/messages/send"
+          }
+        },
+        {
+          "name": "Send - idempotent replay (same key + same body)",
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"userId\": \"{{userId}}\",\n  \"idempotencyKey\": \"fixed-idem-1\",\n  \"otpMessages\": [],\n  \"textMessages\": [\n    {\n      \"type\": \"normal\",\n      \"text\": \"Replay me\",\n      \"recipients\": [\"09121234567\"]\n    }\n  ]\n}"
+            },
+            "url": "{{baseUrl}}/messages/send",
+            "description": "Run twice. Second call should return the same cached response."
+          }
+        },
+        {
+          "name": "Send - idempotency conflict (same key + different body)",
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"userId\": \"{{userId}}\",\n  \"idempotencyKey\": \"fixed-idem-1\",\n  \"otpMessages\": [],\n  \"textMessages\": [\n    {\n      \"type\": \"normal\",\n      \"text\": \"Different payload\",\n      \"recipients\": [\"09121234567\"]\n    }\n  ]\n}"
+            },
+            "url": "{{baseUrl}}/messages/send",
+            "description": "After running 'idempotent replay' once, this should return 409 conflict."
+          }
+        },
+        {
+          "name": "Send - validation missing idempotencyKey",
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"userId\": \"{{userId}}\",\n  \"idempotencyKey\": \"\",\n  \"otpMessages\": [],\n  \"textMessages\": [\n    {\n      \"type\": \"normal\",\n      \"text\": \"Hello\",\n      \"recipients\": [\"09121234567\"]\n    }\n  ]\n}"
+            },
+            "url": "{{baseUrl}}/messages/send"
+          }
+        },
+        {
+          "name": "Send - validation invalid delivery mode",
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"userId\": \"{{userId}}\",\n  \"idempotencyKey\": \"bad-mode-1\",\n  \"otpMessages\": [],\n  \"textMessages\": [\n    {\n      \"type\": \"fast\",\n      \"text\": \"Hello\",\n      \"recipients\": [\"09121234567\"]\n    }\n  ]\n}"
+            },
+            "url": "{{baseUrl}}/messages/send"
+          }
+        },
+        {
+          "name": "Send - validation empty messages",
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"userId\": \"{{userId}}\",\n  \"idempotencyKey\": \"empty-msg-1\",\n  \"otpMessages\": [],\n  \"textMessages\": []\n}"
+            },
+            "url": "{{baseUrl}}/messages/send"
+          }
+        },
+        {
+          "name": "Send - user not found",
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"userId\": \"999999\",\n  \"idempotencyKey\": \"missing-user-1\",\n  \"otpMessages\": [],\n  \"textMessages\": [\n    {\n      \"type\": \"normal\",\n      \"text\": \"Hello\",\n      \"recipients\": [\"09121234567\"]\n    }\n  ]\n}"
+            },
+            "url": "{{baseUrl}}/messages/send"
+          }
+        },
+        {
+          "name": "Send - insufficient balance",
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"userId\": \"{{userId}}\",\n  \"idempotencyKey\": \"no-balance-{{$timestamp}}\",\n  \"otpMessages\": [],\n  \"textMessages\": [\n    {\n      \"type\": \"express\",\n      \"text\": \"Burn balance\",\n      \"recipients\": [\"09120000001\", \"09120000002\", \"09120000003\", \"09120000004\", \"09120000005\", \"09120000006\", \"09120000007\", \"09120000008\", \"09120000009\", \"09120000010\", \"09120000011\", \"09120000012\", \"09120000013\", \"09120000014\", \"09120000015\", \"09120000016\", \"09120000017\", \"09120000018\", \"09120000019\", \"09120000020\", \"09120000021\", \"09120000022\", \"09120000023\", \"09120000024\", \"09120000025\", \"09120000026\", \"09120000027\", \"09120000028\", \"09120000029\", \"09120000030\", \"09120000031\", \"09120000032\", \"09120000033\", \"09120000034\", \"09120000035\", \"09120000036\", \"09120000037\", \"09120000038\", \"09120000039\", \"09120000040\", \"09120000041\", \"09120000042\", \"09120000043\", \"09120000044\", \"09120000045\", \"09120000046\", \"09120000047\", \"09120000048\", \"09120000049\", \"09120000050\"]\n    }\n  ]\n}"
+            },
+            "url": "{{baseUrl}}/messages/send",
+            "description": "50 express texts = 1500 cost. Use a low-balance user or drain balance first to get 402."
+          }
+        }
+      ]
+    },
+    {
+      "name": "Messages - List",
+      "item": [
+        {
+          "name": "List all",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": "{{baseUrl}}/messages"
+          }
+        },
+        {
+          "name": "List by userId",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": "{{baseUrl}}/messages?userId={{userId}}"
+          }
+        },
+        {
+          "name": "List by requestId",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": "{{baseUrl}}/messages?requestId={{requestId}}"
+          }
+        },
+        {
+          "name": "List by status=accepted",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": "{{baseUrl}}/messages?status=accepted"
+          }
+        },
+        {
+          "name": "List by status=rejected",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": "{{baseUrl}}/messages?status=rejected"
+          }
+        },
+        {
+          "name": "List by type=otp",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": "{{baseUrl}}/messages?type=otp"
+          }
+        },
+        {
+          "name": "List by type=text",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": "{{baseUrl}}/messages?type=text"
+          }
+        },
+        {
+          "name": "List by deliveryMode=express",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": "{{baseUrl}}/messages?deliveryMode=express"
+          }
+        },
+        {
+          "name": "List by deliveryMode=normal",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": "{{baseUrl}}/messages?deliveryMode=normal"
+          }
+        },
+        {
+          "name": "List by recipient",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": "{{baseUrl}}/messages?recipient=09121234567"
+          }
+        },
+        {
+          "name": "List by errorCode",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": "{{baseUrl}}/messages?errorCode=invalid_mobile"
+          }
+        },
+        {
+          "name": "List combined filters",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": "{{baseUrl}}/messages?userId={{userId}}&status=accepted&type=text&deliveryMode=normal"
+          }
+        },
+        {
+          "name": "List - validation invalid status",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": "{{baseUrl}}/messages?status=unknown"
+          }
+        }
+      ]
+    }
+  ]
+}

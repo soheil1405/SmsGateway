@@ -1,0 +1,443 @@
+openapi: 3.0.3
+info:
+  title: Arvan SMS API
+  version: 1.0.0
+  description: |
+    Modular monolith SMS API.
+
+    **Response envelope**
+    - Success: `{ "data": ... }`
+    - Error: `{ "error": { "code", "message", "fields?" } }`
+
+    **Message costs**
+    - OTP: 50
+    - Text normal: 20
+    - Text express: 30
+servers:
+  - url: http://localhost:8080
+    description: local
+
+tags:
+  - name: Health
+  - name: Users
+  - name: Messages
+
+paths:
+  /health:
+    get:
+      tags: [Health]
+      summary: Health check
+      operationId: healthCheck
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status:
+                    type: string
+                    example: ok
+
+  /users/{id}:
+    get:
+      tags: [Users]
+      summary: Get user by id
+      operationId: getUser
+      parameters:
+        - $ref: "#/components/parameters/UserIdPath"
+      responses:
+        "200":
+          description: User found
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/UserEnvelope"
+              example:
+                data:
+                  id: 1
+                  name: Soheil
+                  balance: 10000
+                  createdAt: "2026-09-16T12:00:00Z"
+                  updatedAt: "2026-09-16T12:00:00Z"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+  /users/{id}/add-balance:
+    post:
+      tags: [Users]
+      summary: Add balance to user
+      operationId: addBalance
+      parameters:
+        - $ref: "#/components/parameters/UserIdPath"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/AddBalanceRequest"
+            examples:
+              ok:
+                value: { amount: 5000 }
+              invalid:
+                value: { amount: 0 }
+      responses:
+        "200":
+          description: Balance updated
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/UserEnvelope"
+        "400":
+          $ref: "#/components/responses/ValidationError"
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+  /messages/send:
+    post:
+      tags: [Messages]
+      summary: Accept and queue messages (OTP + text)
+      operationId: sendMessages
+      description: |
+        Idempotent by `(userId, idempotencyKey)`.
+        Invalid recipients become `rejected` items (request still succeeds).
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/SendMessagesRequest"
+            examples:
+              otpAndText:
+                summary: OTP express + text normal
+                value:
+                  userId: "1"
+                  idempotencyKey: "abc-123"
+                  otpMessages:
+                    - type: express
+                      template: "Hi {{name}}, amount {{amount}}"
+                      recipients:
+                        - mobile: "09121234567"
+                          variables: { name: "Soheil", amount: "2000" }
+                  textMessages:
+                    - type: normal
+                      text: "Hello"
+                      recipients: ["09121234567", "09351234567"]
+              otpOnly:
+                summary: OTP only
+                value:
+                  userId: "1"
+                  idempotencyKey: "otp-only-1"
+                  otpMessages:
+                    - type: express
+                      template: "code is {{code}}"
+                      recipients:
+                        - mobile: "09121234567"
+                          variables: { code: "123456" }
+                  textMessages: []
+              textOnly:
+                summary: Text only
+                value:
+                  userId: "1"
+                  idempotencyKey: "text-only-1"
+                  otpMessages: []
+                  textMessages:
+                    - type: express
+                      text: "Urgent hello"
+                      recipients: ["09121234567"]
+              withRejectedMobile:
+                summary: One invalid mobile gets rejected
+                value:
+                  userId: "1"
+                  idempotencyKey: "reject-mobile-1"
+                  otpMessages: []
+                  textMessages:
+                    - type: normal
+                      text: "Hello"
+                      recipients: ["09121234567", "bad"]
+              validationMissingKey:
+                summary: Validation error sample
+                value:
+                  userId: "1"
+                  idempotencyKey: ""
+                  textMessages:
+                    - type: normal
+                      text: "Hello"
+                      recipients: ["09121234567"]
+      responses:
+        "200":
+          description: Accepted (may include rejected per-recipient items)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SendMessagesEnvelope"
+        "400":
+          $ref: "#/components/responses/ValidationError"
+        "402":
+          description: Insufficient balance
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorEnvelope"
+              example:
+                error:
+                  code: insufficient_balance
+                  message: insufficient balance
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          description: Idempotency key reused with different payload
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorEnvelope"
+              example:
+                error:
+                  code: conflict
+                  message: idempotency key reused with different payload
+
+  /messages:
+    get:
+      tags: [Messages]
+      summary: List messages with filters
+      operationId: listMessages
+      parameters:
+        - name: userId
+          in: query
+          schema: { type: integer, format: int64 }
+        - name: requestId
+          in: query
+          schema: { type: integer, format: int64 }
+        - name: status
+          in: query
+          schema:
+            type: string
+            enum: [accepted, queued, sending, sent, failed, rejected]
+        - name: type
+          in: query
+          schema:
+            type: string
+            enum: [otp, text]
+        - name: deliveryMode
+          in: query
+          schema:
+            type: string
+            enum: [express, normal]
+        - name: recipient
+          in: query
+          schema: { type: string }
+        - name: errorCode
+          in: query
+          schema: { type: string }
+      responses:
+        "200":
+          description: Message list
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/MessageListEnvelope"
+        "400":
+          $ref: "#/components/responses/ValidationError"
+
+components:
+  parameters:
+    UserIdPath:
+      name: id
+      in: path
+      required: true
+      schema:
+        type: integer
+        format: int64
+        minimum: 1
+
+  schemas:
+    EnvelopeError:
+      type: object
+      required: [code, message]
+      properties:
+        code: { type: string }
+        message: { type: string }
+        fields:
+          type: array
+          items:
+            type: object
+            properties:
+              field: { type: string }
+              message: { type: string }
+
+    ErrorEnvelope:
+      type: object
+      properties:
+        error:
+          $ref: "#/components/schemas/EnvelopeError"
+
+    User:
+      type: object
+      properties:
+        id: { type: integer, format: int64 }
+        name: { type: string }
+        balance: { type: integer, format: int64 }
+        createdAt: { type: string, format: date-time }
+        updatedAt: { type: string, format: date-time }
+
+    UserEnvelope:
+      type: object
+      properties:
+        data:
+          $ref: "#/components/schemas/User"
+
+    AddBalanceRequest:
+      type: object
+      required: [amount]
+      properties:
+        amount:
+          type: integer
+          format: int64
+          minimum: 1
+
+    OtpRecipient:
+      type: object
+      required: [mobile]
+      properties:
+        mobile: { type: string, example: "09121234567" }
+        variables:
+          type: object
+          additionalProperties: { type: string }
+
+    OtpMessageGroup:
+      type: object
+      required: [type, template, recipients]
+      properties:
+        type:
+          type: string
+          enum: [express, normal]
+        template: { type: string }
+        recipients:
+          type: array
+          minItems: 1
+          items:
+            $ref: "#/components/schemas/OtpRecipient"
+
+    TextMessageGroup:
+      type: object
+      required: [type, text, recipients]
+      properties:
+        type:
+          type: string
+          enum: [express, normal]
+        text: { type: string }
+        recipients:
+          type: array
+          minItems: 1
+          items: { type: string }
+
+    SendMessagesRequest:
+      type: object
+      required: [userId, idempotencyKey]
+      properties:
+        userId: { type: string, example: "1" }
+        idempotencyKey: { type: string, example: "abc-123" }
+        otpMessages:
+          type: array
+          items:
+            $ref: "#/components/schemas/OtpMessageGroup"
+        textMessages:
+          type: array
+          items:
+            $ref: "#/components/schemas/TextMessageGroup"
+
+    MessageItem:
+      type: object
+      properties:
+        id: { type: integer, format: int64 }
+        recipient: { type: string }
+        type: { type: string, enum: [otp, text] }
+        deliveryMode: { type: string, enum: [express, normal] }
+        status:
+          type: string
+          enum: [accepted, queued, sending, sent, failed, rejected]
+        cost: { type: integer, format: int64 }
+        errorCode: { type: string }
+        text: { type: string }
+
+    SendMessagesResult:
+      type: object
+      properties:
+        requestId: { type: integer, format: int64 }
+        totalCost: { type: integer, format: int64 }
+        acceptedCount: { type: integer }
+        rejectedCount: { type: integer }
+        messages:
+          type: array
+          items:
+            $ref: "#/components/schemas/MessageItem"
+
+    SendMessagesEnvelope:
+      type: object
+      properties:
+        data:
+          $ref: "#/components/schemas/SendMessagesResult"
+
+    MessageDetail:
+      type: object
+      properties:
+        id: { type: integer, format: int64 }
+        requestId: { type: integer, format: int64 }
+        userId: { type: integer, format: int64 }
+        recipient: { type: string }
+        type: { type: string, enum: [otp, text] }
+        deliveryMode: { type: string, enum: [express, normal] }
+        text: { type: string }
+        status:
+          type: string
+          enum: [accepted, queued, sending, sent, failed, rejected]
+        cost: { type: integer, format: int64 }
+        errorCode: { type: string }
+        createdAt: { type: string, format: date-time }
+        updatedAt: { type: string, format: date-time }
+
+    MessageListEnvelope:
+      type: object
+      properties:
+        data:
+          type: array
+          items:
+            $ref: "#/components/schemas/MessageDetail"
+
+  responses:
+    BadRequest:
+      description: Bad request
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorEnvelope"
+          example:
+            error:
+              code: bad_request
+              message: invalid id
+    ValidationError:
+      description: Validation failed
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorEnvelope"
+          example:
+            error:
+              code: validation_error
+              message: validation failed
+              fields:
+                - field: amount
+                  message: must be > 0
+    NotFound:
+      description: Resource not found
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorEnvelope"
+          example:
+            error:
+              code: not_found
+              message: resource not found
