@@ -2,220 +2,195 @@ package messaging
 
 import (
 	"context"
-	"crypto/sha256"
-	"database/sql"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"strconv"
 
 	"github.com/soheil/arvan/internal/messaging/domain"
-	"github.com/soheil/arvan/internal/user"
 	"github.com/soheil/arvan/utils/errs"
+	"github.com/soheil/arvan/utils/kafka"
 )
 
+// UseCase منطق کسب‌وکار ارسال و لیست پیام‌ها را مدیریت می‌کند.
 type UseCase struct {
-	repo     *Repo
-	userRepo *user.Repo
+	repo  *Repo
+	redis *RedisStore
+	kafka *kafka.Producer
 }
 
-func NewUseCase(repo *Repo, userRepo *user.Repo) *UseCase {
-	return &UseCase{repo: repo, userRepo: userRepo}
+// NewUseCase یک نمونه UseCase با وابستگی‌های لازم می‌سازد.
+func NewUseCase(repo *Repo, redis *RedisStore, producer *kafka.Producer) *UseCase {
+	return &UseCase{
+		repo:  repo,
+		redis: redis,
+		kafka: producer,
+	}
 }
 
-func (uc *UseCase) Send(ctx context.Context, cmd SendCommand) (*SendResult, error) {
-	payloadHash, err := hashCommand(cmd)
+// Send جریان ارسال پیامک:
+// ۱) کش Redis idempotency
+// ۲) در صورت miss → PostgreSQL (source of truth)
+// ۳) در غیر این صورت: قفل موجودی → plan → debit → ذخیره → Kafka
+func (uc *UseCase) Send(ctx context.Context, req SendMsgRequest) (*SendResult, error) {
+	if result, ok, err := uc.resolveIdempotent(ctx, req.UserID, req.IdempotencyKey); err != nil {
+		return nil, err
+	} else if ok {
+		return result, nil
+	}
+
+	result, err := uc.persistAndPublish(ctx, req)
 	if err != nil {
 		return nil, err
 	}
 
-	if cached, ok, err := uc.tryIdempotent(ctx, cmd.UserID, cmd.IdempotencyKey, payloadHash); err != nil {
-		return nil, err
-	} else if ok {
-		return cached, nil
-	}
-
-	if _, err := uc.userRepo.GetByID(ctx, cmd.UserID); err != nil {
-		if errors.Is(err, user.ErrNotFound) {
-			return nil, errs.ErrNotFound
-		}
-		return nil, err
-	}
-
-	messages := buildMessages(cmd)
-	totalCost := sumAcceptedCost(messages)
-
-	result, err := uc.persistSend(ctx, cmd, payloadHash, messages, totalCost)
-	if errors.Is(err, ErrConflict) {
-		// concurrent duplicate with same idempotency key
-		cached, ok, loadErr := uc.tryIdempotent(ctx, cmd.UserID, cmd.IdempotencyKey, payloadHash)
-		if loadErr != nil {
-			return nil, loadErr
-		}
-		if ok {
-			return cached, nil
-		}
-		return nil, errs.ErrConflict
-	}
-	return result, err
+	// بهترین تلاش برای پر کردن کش؛ شکست Redis پاسخ موفق را خراب نمی‌کند
+	_ = uc.redis.SaveIdempotentResult(ctx, req.UserID, req.IdempotencyKey, result)
+	return result, nil
 }
 
-func (uc *UseCase) ListMessages(ctx context.Context, filter MessageFilter) ([]domain.Message, error) {
-	return uc.repo.ListMessages(ctx, filter)
+// resolveIdempotent اول Redis (cache) و در صورت miss، PostgreSQL را چک می‌کند.
+// ok=true یعنی نتیجهٔ قبلی پیدا شد.
+func (uc *UseCase) resolveIdempotent(ctx context.Context, userID int64, key string) (*SendResult, bool, error) {
+	cached, ok, err := uc.redis.GetIdempotentResult(ctx, userID, key)
+	if err == nil && ok {
+		return cached, true, nil
+	}
+	// خطای Redis مثل miss تلقی می‌شود؛ Postgres منبع حقیقت است
+
+	return uc.loadIdempotentFromDB(ctx, userID, key)
 }
 
-func (uc *UseCase) tryIdempotent(ctx context.Context, userID int64, key, hash string) (*SendResult, bool, error) {
-	existing, err := uc.repo.FindRequestByIdempotency(ctx, userID, key)
+// loadIdempotentFromDB نتیجه را از response_json می‌خواند و در Redis دوباره cache می‌کند.
+func (uc *UseCase) loadIdempotentFromDB(ctx context.Context, userID int64, key string) (*SendResult, bool, error) {
+	req, err := uc.repo.FindRequestByIdempotency(ctx, userID, key)
 	if errors.Is(err, ErrNotFound) {
 		return nil, false, nil
 	}
 	if err != nil {
 		return nil, false, err
 	}
-	if existing.PayloadHash != hash {
-		return nil, false, errs.ErrConflict
-	}
-	if len(existing.ResponseJSON) == 0 {
-		return nil, false, errors.New("idempotent request exists but response is not ready")
+	if len(req.ResponseJSON) == 0 {
+		return nil, false, nil
 	}
 
 	var result SendResult
-	if err := json.Unmarshal(existing.ResponseJSON, &result); err != nil {
+	if err := json.Unmarshal(req.ResponseJSON, &result); err != nil {
 		return nil, false, err
 	}
+
+	_ = uc.redis.SaveIdempotentResult(ctx, userID, key, &result)
 	return &result, true, nil
 }
 
-func (uc *UseCase) persistSend(
-	ctx context.Context,
-	cmd SendCommand,
-	payloadHash string,
-	messages []domain.Message,
-	totalCost int64,
-) (*SendResult, error) {
+// ListMessages پیام‌ها را با فیلتر اختیاری برمی‌گرداند.
+func (uc *UseCase) ListMessages(ctx context.Context, filter MessageFilter) ([]domain.Message, error) {
+	return uc.repo.ListMessages(ctx, filter)
+}
+
+// persistAndPublish موجودی را در Postgres قفل/کسر می‌کند، پیام‌های payable را ذخیره
+// و بعد از commit به Kafka می‌فرستد. skipped فقط در پاسخ می‌آید.
+func (uc *UseCase) persistAndPublish(ctx context.Context, cmd SendMsgRequest) (*SendResult, error) {
 	tx, err := uc.repo.Begin(ctx)
 	if err != nil {
 		return nil, err
 	}
 	defer tx.Rollback()
 
+	balance, err := uc.repo.GetBalanceForUpdate(ctx, tx, cmd.UserID)
+	if err != nil {
+		if errors.Is(err, ErrNotFound) {
+			return nil, errs.ErrNotFound
+		}
+		return nil, err
+	}
+
+	planned := planSend(cmd, balance)
+	if err := uc.repo.DebitBalance(ctx, tx, cmd.UserID, planned.TotalCost); err != nil {
+		if errors.Is(err, ErrInsufficientBalance) {
+			return nil, errs.ErrInsufficientBalance
+		}
+		return nil, err
+	}
+
 	req := &domain.Request{
 		UserID:         cmd.UserID,
 		IdempotencyKey: cmd.IdempotencyKey,
-		PayloadHash:    payloadHash,
+		TotalCost:      planned.TotalCost,
 	}
 	if err := uc.repo.CreateRequest(ctx, tx, req); err != nil {
+		if errors.Is(err, ErrConflict) {
+			// TX جاری rollback می‌شود (debit هم لغو)؛ نتیجهٔ برنده از Postgres خوانده می‌شود
+			_ = tx.Rollback()
+			result, ok, e := uc.loadIdempotentFromDB(ctx, cmd.UserID, cmd.IdempotencyKey)
+			if e != nil {
+				return nil, e
+			}
+			if ok {
+				return result, nil
+			}
+			return nil, errs.ErrConflict
+		}
 		return nil, err
 	}
 
-	if err := uc.reserveBalance(ctx, tx, cmd.UserID, req.ID, totalCost); err != nil {
-		return nil, err
-	}
+	accepted := make([]MessageResult, 0, len(planned.Payable))
+	kafkaBatch := make([]kafka.Message, 0, len(planned.Payable))
+	for i := range planned.Payable {
+		msg := &planned.Payable[i]
+		msg.RequestID = req.ID
+		msg.Status = domain.MessageQueued
 
-	results, accepted, rejected, err := uc.saveMessages(ctx, tx, req.ID, messages)
-	if err != nil {
-		return nil, err
-	}
-
-	if totalCost > 0 {
-		if err := uc.repo.CommitReservation(ctx, tx, req.ID); err != nil {
+		if err := uc.repo.CreateMessage(ctx, tx, msg); err != nil {
 			return nil, err
 		}
+		accepted = append(accepted, toMessageResult(msg))
+
+		payload, err := json.Marshal(map[string]any{
+			"messageId":    msg.ID,
+			"requestId":    msg.RequestID,
+			"userId":       msg.UserID,
+			"recipient":    msg.Recipient,
+			"text":         msg.Text,
+			"type":         msg.Type,
+			"deliveryMode": msg.DeliveryMode,
+			"cost":         msg.Cost,
+		})
+		if err != nil {
+			return nil, err
+		}
+		kafkaBatch = append(kafkaBatch, kafka.Message{
+			Topic: kafkaTopic(msg.DeliveryMode, uc.kafka.TopicNormal(), uc.kafka.TopicExpress()),
+			Key:   strconv.FormatInt(msg.ID, 10),
+			Value: payload,
+		})
 	}
 
 	result := &SendResult{
 		RequestID:     req.ID,
-		TotalCost:     totalCost,
-		AcceptedCount: accepted,
-		RejectedCount: rejected,
-		Messages:      results,
+		TotalCost:     planned.TotalCost,
+		AcceptedCount: len(accepted),
+		RejectedCount: planned.RejectedCount,
+		SkippedCount:  planned.SkippedCount,
+		Messages:      accepted,
+		Skipped:       planned.Skipped,
 	}
 
 	raw, err := json.Marshal(result)
 	if err != nil {
 		return nil, err
 	}
-	if err := uc.repo.UpdateRequestResponse(ctx, tx, req.ID, accepted, rejected, totalCost, raw); err != nil {
+	if err := uc.repo.UpdateRequestResponse(ctx, tx, req.ID, result.AcceptedCount, result.RejectedCount, planned.TotalCost, raw); err != nil {
 		return nil, err
 	}
-
 	if err := tx.Commit(); err != nil {
 		return nil, err
 	}
+
+	if err := uc.kafka.PublishBatch(ctx, kafkaBatch); err != nil {
+		return nil, err
+	}
+
 	return result, nil
-}
-
-func (uc *UseCase) reserveBalance(ctx context.Context, tx *sql.Tx, userID, requestID, totalCost int64) error {
-	if totalCost <= 0 {
-		return nil
-	}
-
-	if err := uc.repo.ReserveUserBalance(ctx, tx, userID, totalCost); err != nil {
-		return mapRepoErr(err)
-	}
-
-	reservation := &domain.BalanceReservation{
-		UserID:    userID,
-		RequestID: requestID,
-		Amount:    totalCost,
-		Status:    domain.ReservationPending,
-		ExpiresAt: DefaultReservationExpiry(),
-	}
-	return uc.repo.CreateReservation(ctx, tx, reservation)
-}
-
-func (uc *UseCase) saveMessages(
-	ctx context.Context,
-	tx *sql.Tx,
-	requestID int64,
-	messages []domain.Message,
-) ([]MessageResult, int, int, error) {
-	results := make([]MessageResult, 0, len(messages))
-	accepted, rejected := 0, 0
-
-	for i := range messages {
-		msg := &messages[i]
-		msg.RequestID = requestID
-
-		if err := uc.repo.CreateMessage(ctx, tx, msg); err != nil {
-			return nil, 0, 0, err
-		}
-
-		if msg.Status == domain.MessageAccepted {
-			accepted++
-			if err := uc.enqueueOutbox(ctx, tx, msg); err != nil {
-				return nil, 0, 0, err
-			}
-		} else {
-			rejected++
-		}
-
-		results = append(results, toMessageResult(msg))
-	}
-
-	return results, accepted, rejected, nil
-}
-
-func (uc *UseCase) enqueueOutbox(ctx context.Context, tx *sql.Tx, msg *domain.Message) error {
-	payload, err := json.Marshal(map[string]any{
-		"messageId": msg.ID,
-		"userId":    msg.UserID,
-		"recipient": msg.Recipient,
-		"text":      msg.Text,
-		"type":      msg.Type,
-	})
-	if err != nil {
-		return err
-	}
-
-	event := &domain.OutboxEvent{
-		AggregateID:  msg.ID,
-		Topic:        outboxTopic(msg.DeliveryMode),
-		PartitionKey: strconv.FormatInt(msg.ID, 10),
-		Payload:      payload,
-		Status:       domain.OutboxPending,
-	}
-	return uc.repo.CreateOutbox(ctx, tx, event)
 }
 
 func toMessageResult(msg *domain.Message) MessageResult {
@@ -232,26 +207,4 @@ func toMessageResult(msg *domain.Message) MessageResult {
 		item.ErrorCode = *msg.ErrorCode
 	}
 	return item
-}
-
-func hashCommand(cmd SendCommand) (string, error) {
-	raw, err := json.Marshal(cmd)
-	if err != nil {
-		return "", err
-	}
-	sum := sha256.Sum256(raw)
-	return hex.EncodeToString(sum[:]), nil
-}
-
-func mapRepoErr(err error) error {
-	switch {
-	case errors.Is(err, ErrNotFound):
-		return errs.ErrNotFound
-	case errors.Is(err, ErrInsufficientBalance):
-		return errs.ErrInsufficientBalance
-	case errors.Is(err, ErrConflict):
-		return errs.ErrConflict
-	default:
-		return err
-	}
 }

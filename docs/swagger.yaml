@@ -96,108 +96,84 @@ paths:
         "404":
           $ref: "#/components/responses/NotFound"
 
-  /messages/send:
+  /messages/send/otp:
     post:
       tags: [Messages]
-      summary: Accept and queue messages (OTP + text)
-      operationId: sendMessages
+      summary: Send OTP messages
+      operationId: sendOTP
       description: |
         Idempotent by `(userId, idempotencyKey)`.
-        Invalid recipients become `rejected` items (request still succeeds).
+        OTP is converted to text/normal before queueing.
       requestBody:
         required: true
         content:
           application/json:
             schema:
-              $ref: "#/components/schemas/SendMessagesRequest"
-            examples:
-              otpAndText:
-                summary: OTP express + text normal
-                value:
-                  userId: "1"
-                  idempotencyKey: "abc-123"
-                  otpMessages:
-                    - type: express
-                      template: "Hi {{name}}, amount {{amount}}"
-                      recipients:
-                        - mobile: "09121234567"
-                          variables: { name: "Soheil", amount: "2000" }
-                  textMessages:
-                    - type: normal
-                      text: "Hello"
-                      recipients: ["09121234567", "09351234567"]
-              otpOnly:
-                summary: OTP only
-                value:
-                  userId: "1"
-                  idempotencyKey: "otp-only-1"
-                  otpMessages:
-                    - type: express
-                      template: "code is {{code}}"
-                      recipients:
-                        - mobile: "09121234567"
-                          variables: { code: "123456" }
-                  textMessages: []
-              textOnly:
-                summary: Text only
-                value:
-                  userId: "1"
-                  idempotencyKey: "text-only-1"
-                  otpMessages: []
-                  textMessages:
-                    - type: express
-                      text: "Urgent hello"
-                      recipients: ["09121234567"]
-              withRejectedMobile:
-                summary: One invalid mobile gets rejected
-                value:
-                  userId: "1"
-                  idempotencyKey: "reject-mobile-1"
-                  otpMessages: []
-                  textMessages:
-                    - type: normal
-                      text: "Hello"
-                      recipients: ["09121234567", "bad"]
-              validationMissingKey:
-                summary: Validation error sample
-                value:
-                  userId: "1"
-                  idempotencyKey: ""
-                  textMessages:
-                    - type: normal
-                      text: "Hello"
-                      recipients: ["09121234567"]
+              $ref: "#/components/schemas/SendOTPRequest"
+            example:
+              userId: "1"
+              idempotencyKey: "otp-123"
+              type: express
+              template: "Hi {{name}}, code {{code}}"
+              recipients:
+                - mobile: "09121234567"
+                  variables: { name: "Soheil", code: "123456" }
+                - mobile: "09351234567"
+                  variables: { name: "Ali", code: "654321" }
       responses:
         "200":
-          description: Accepted (may include rejected per-recipient items)
+          description: Accepted (may include skipped/rejected per-recipient items)
           content:
             application/json:
               schema:
                 $ref: "#/components/schemas/SendMessagesEnvelope"
         "400":
           $ref: "#/components/responses/ValidationError"
-        "402":
-          description: Insufficient balance
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/ErrorEnvelope"
-              example:
-                error:
-                  code: insufficient_balance
-                  message: insufficient balance
         "404":
           $ref: "#/components/responses/NotFound"
         "409":
-          description: Idempotency key reused with different payload
+          description: Idempotency conflict
           content:
             application/json:
               schema:
                 $ref: "#/components/schemas/ErrorEnvelope"
-              example:
-                error:
-                  code: conflict
-                  message: idempotency key reused with different payload
+
+  /messages/send/text:
+    post:
+      tags: [Messages]
+      summary: Send text messages
+      operationId: sendText
+      description: |
+        Idempotent by `(userId, idempotencyKey)`.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/SendTextRequest"
+            example:
+              userId: "1"
+              idempotencyKey: "text-123"
+              type: normal
+              text: "Hello"
+              recipients: ["09121234567", "09351234567"]
+      responses:
+        "200":
+          description: Accepted (may include skipped/rejected per-recipient items)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SendMessagesEnvelope"
+        "400":
+          $ref: "#/components/responses/ValidationError"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          description: Idempotency conflict
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorEnvelope"
 
   /messages:
     get:
@@ -307,10 +283,12 @@ components:
           type: object
           additionalProperties: { type: string }
 
-    OtpMessageGroup:
+    SendOTPRequest:
       type: object
-      required: [type, template, recipients]
+      required: [userId, idempotencyKey, type, template, recipients]
       properties:
+        userId: { type: string, example: "1" }
+        idempotencyKey: { type: string, example: "otp-123" }
         type:
           type: string
           enum: [express, normal]
@@ -321,10 +299,12 @@ components:
           items:
             $ref: "#/components/schemas/OtpRecipient"
 
-    TextMessageGroup:
+    SendTextRequest:
       type: object
-      required: [type, text, recipients]
+      required: [userId, idempotencyKey, type, text, recipients]
       properties:
+        userId: { type: string, example: "1" }
+        idempotencyKey: { type: string, example: "text-123" }
         type:
           type: string
           enum: [express, normal]
@@ -333,21 +313,6 @@ components:
           type: array
           minItems: 1
           items: { type: string }
-
-    SendMessagesRequest:
-      type: object
-      required: [userId, idempotencyKey]
-      properties:
-        userId: { type: string, example: "1" }
-        idempotencyKey: { type: string, example: "abc-123" }
-        otpMessages:
-          type: array
-          items:
-            $ref: "#/components/schemas/OtpMessageGroup"
-        textMessages:
-          type: array
-          items:
-            $ref: "#/components/schemas/TextMessageGroup"
 
     MessageItem:
       type: object

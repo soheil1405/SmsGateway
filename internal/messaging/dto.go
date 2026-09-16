@@ -1,144 +1,111 @@
 package messaging
 
 import (
-	"fmt"
 	"strconv"
 	"strings"
 	"time"
 
-	"github.com/soheil/arvan/utils/errs"
 	"github.com/soheil/arvan/internal/messaging/domain"
+	"github.com/soheil/arvan/utils/errs"
 )
 
-// --- HTTP request ---
+// --- بدنهٔ HTTP برای ارسال OTP ---
 
-type sendMessagesRequest struct {
-	UserID         string             `json:"userId"`
-	IdempotencyKey string             `json:"idempotencyKey"`
-	OTPMessages    []otpMessageGroup  `json:"otpMessages"`
-	TextMessages   []textMessageGroup `json:"textMessages"`
+// sendOTPRequest بدنهٔ درخواست POST /messages/send/otp است.
+type sendOTPRequest struct {
+	UserID         string         `json:"userId"`
+	IdempotencyKey string         `json:"idempotencyKey"`
+	Type           string         `json:"type"` // express یا normal (در عمل OTP همیشه normal می‌شود)
+	Template       string         `json:"template"`
+	Recipients     []OTPRecipient `json:"recipients"`
 }
 
-type otpMessageGroup struct {
-	Type       string         `json:"type"`
-	Template   string         `json:"template"`
-	Recipients []otpRecipient `json:"recipients"`
-}
-
-type otpRecipient struct {
-	Mobile    string            `json:"mobile"`
-	Variables map[string]string `json:"variables"`
-}
-
-type textMessageGroup struct {
-	Type       string   `json:"type"`
-	Text       string   `json:"text"`
-	Recipients []string `json:"recipients"`
-}
-
-func (r sendMessagesRequest) validate() error {
+// validate فیلدهای اجباری و مقادیر مجاز را بررسی می‌کند.
+func (r sendOTPRequest) validate() error {
 	v := &errs.Validation{}
+	validateCommon(v, r.UserID, r.IdempotencyKey)
 
-	if strings.TrimSpace(r.UserID) == "" {
-		v.Add("userId", "required")
-	} else if _, err := strconv.ParseInt(r.UserID, 10, 64); err != nil {
-		v.Add("userId", "must be a valid integer")
+	if r.Type != "express" && r.Type != "normal" {
+		v.Add("type", "must be express or normal")
 	}
-
-	if strings.TrimSpace(r.IdempotencyKey) == "" {
-		v.Add("idempotencyKey", "required")
+	if strings.TrimSpace(r.Template) == "" {
+		v.Add("template", "required")
 	}
-
-	if len(r.OTPMessages) == 0 && len(r.TextMessages) == 0 {
-		v.Add("messages", "at least one otpMessages or textMessages entry is required")
+	if len(r.Recipients) == 0 {
+		v.Add("recipients", "required")
 	}
-
-	for i, g := range r.OTPMessages {
-		prefix := fmt.Sprintf("otpMessages[%d]", i)
-		if g.Type != "express" && g.Type != "normal" {
-			v.Add(prefix+".type", "must be express or normal")
-		}
-		if strings.TrimSpace(g.Template) == "" {
-			v.Add(prefix+".template", "required")
-		}
-		if len(g.Recipients) == 0 {
-			v.Add(prefix+".recipients", "required")
-		}
-	}
-
-	for i, g := range r.TextMessages {
-		prefix := fmt.Sprintf("textMessages[%d]", i)
-		if g.Type != "express" && g.Type != "normal" {
-			v.Add(prefix+".type", "must be express or normal")
-		}
-		if strings.TrimSpace(g.Text) == "" {
-			v.Add(prefix+".text", "required")
-		}
-		if len(g.Recipients) == 0 {
-			v.Add(prefix+".recipients", "required")
-		}
-	}
-
 	return v.Err()
 }
 
-func (r sendMessagesRequest) toCommand() SendCommand {
+// toCommand بدنهٔ HTTP را به فرمان داخلی UseCase تبدیل می‌کند.
+func (r sendOTPRequest) toCommand() SendMsgRequest {
 	userID, _ := strconv.ParseInt(r.UserID, 10, 64)
-
-	otp := make([]OTPGroup, 0, len(r.OTPMessages))
-	for _, g := range r.OTPMessages {
-		recipients := make([]OTPRecipient, 0, len(g.Recipients))
-		for _, rec := range g.Recipients {
-			recipients = append(recipients, OTPRecipient{
-				Mobile:    rec.Mobile,
-				Variables: rec.Variables,
-			})
-		}
-		otp = append(otp, OTPGroup{
-			DeliveryMode: g.Type,
-			Template:     g.Template,
-			Recipients:   recipients,
-		})
-	}
-
-	text := make([]TextGroup, 0, len(r.TextMessages))
-	for _, g := range r.TextMessages {
-		text = append(text, TextGroup{
-			DeliveryMode: g.Type,
-			Text:         g.Text,
-			Recipients:   g.Recipients,
-		})
-	}
-
-	return SendCommand{
+	return SendMsgRequest{
 		UserID:         userID,
 		IdempotencyKey: r.IdempotencyKey,
-		OTPMessages:    otp,
-		TextMessages:   text,
+		OTP: &OTPPayload{
+			DeliveryMode: r.Type,
+			Template:     r.Template,
+			Recipients:   r.Recipients, // بدون کپی اضافه
+		},
 	}
 }
 
-// --- HTTP response ---
+// --- بدنهٔ HTTP برای ارسال متن ---
 
-type sendMessagesResponse struct {
-	RequestID     int64                `json:"requestId"`
-	TotalCost     int64                `json:"totalCost"`
-	AcceptedCount int                  `json:"acceptedCount"`
-	RejectedCount int                  `json:"rejectedCount"`
-	Messages      []messageItemResponse `json:"messages"`
+// sendTextRequest بدنهٔ درخواست POST /messages/send/text است.
+type sendTextRequest struct {
+	UserID         string   `json:"userId"`
+	IdempotencyKey string   `json:"idempotencyKey"`
+	Type           string   `json:"type"` // express یا normal
+	Text           string   `json:"text"`
+	Recipients     []string `json:"recipients"`
 }
 
-type messageItemResponse struct {
-	ID           int64  `json:"id,omitempty"`
-	Recipient    string `json:"recipient"`
-	Type         string `json:"type"`
-	DeliveryMode string `json:"deliveryMode"`
-	Status       string `json:"status"`
-	Cost         int64  `json:"cost"`
-	ErrorCode    string `json:"errorCode,omitempty"`
-	Text         string `json:"text,omitempty"`
+func (r sendTextRequest) validate() error {
+	v := &errs.Validation{}
+	validateCommon(v, r.UserID, r.IdempotencyKey)
+
+	if r.Type != "express" && r.Type != "normal" {
+		v.Add("type", "must be express or normal")
+	}
+	if strings.TrimSpace(r.Text) == "" {
+		v.Add("text", "required")
+	}
+	if len(r.Recipients) == 0 {
+		v.Add("recipients", "required")
+	}
+	return v.Err()
 }
 
+func (r sendTextRequest) toCommand() SendMsgRequest {
+	userID, _ := strconv.ParseInt(r.UserID, 10, 64)
+	return SendMsgRequest{
+		UserID:         userID,
+		IdempotencyKey: r.IdempotencyKey,
+		Text: &TextPayload{
+			DeliveryMode: r.Type,
+			Text:         r.Text,
+			Recipients:   r.Recipients,
+		},
+	}
+}
+
+// validateCommon قوانین مشترک userId و idempotencyKey را اعمال می‌کند.
+func validateCommon(v *errs.Validation, userID, idempotencyKey string) {
+	if strings.TrimSpace(userID) == "" {
+		v.Add("userId", "required")
+	} else if _, err := strconv.ParseInt(userID, 10, 64); err != nil {
+		v.Add("userId", "must be a valid integer")
+	}
+	if strings.TrimSpace(idempotencyKey) == "" {
+		v.Add("idempotencyKey", "required")
+	}
+}
+
+// --- پاسخ HTTP لیست پیام‌ها ---
+
+// messageDetailResponse شکل کامل یک پیام در لیست است.
 type messageDetailResponse struct {
 	ID           int64     `json:"id"`
 	RequestID    int64     `json:"requestId"`
@@ -154,29 +121,7 @@ type messageDetailResponse struct {
 	UpdatedAt    time.Time `json:"updatedAt"`
 }
 
-func toSendResponse(r *SendResult) sendMessagesResponse {
-	items := make([]messageItemResponse, 0, len(r.Messages))
-	for _, m := range r.Messages {
-		items = append(items, messageItemResponse{
-			ID:           m.ID,
-			Recipient:    m.Recipient,
-			Type:         m.Type,
-			DeliveryMode: m.DeliveryMode,
-			Status:       m.Status,
-			Cost:         m.Cost,
-			ErrorCode:    m.ErrorCode,
-			Text:         m.Text,
-		})
-	}
-	return sendMessagesResponse{
-		RequestID:     r.RequestID,
-		TotalCost:     r.TotalCost,
-		AcceptedCount: r.AcceptedCount,
-		RejectedCount: r.RejectedCount,
-		Messages:      items,
-	}
-}
-
+// toMessageDetailResponse دامنه را به پاسخ HTTP تبدیل می‌کند.
 func toMessageDetailResponse(m *domain.Message) messageDetailResponse {
 	resp := messageDetailResponse{
 		ID:           m.ID,
@@ -197,6 +142,7 @@ func toMessageDetailResponse(m *domain.Message) messageDetailResponse {
 	return resp
 }
 
+// toMessageListResponse لیست دامنه را به پاسخ HTTP تبدیل می‌کند.
 func toMessageListResponse(messages []domain.Message) []messageDetailResponse {
 	out := make([]messageDetailResponse, 0, len(messages))
 	for i := range messages {
@@ -205,16 +151,17 @@ func toMessageListResponse(messages []domain.Message) []messageDetailResponse {
 	return out
 }
 
-// --- list filter ---
+// --- فیلتر لیست ---
 
+// listMessagesRequest پارامترهای query برای GET /messages است.
 type listMessagesRequest struct {
-	UserID       *int64  `query:"userId"`
-	RequestID    *int64  `query:"requestId"`
-	Status       string  `query:"status"`
-	Type         string  `query:"type"`
-	DeliveryMode string  `query:"deliveryMode"`
-	Recipient    string  `query:"recipient"`
-	ErrorCode    string  `query:"errorCode"`
+	UserID       *int64 `query:"userId"`
+	RequestID    *int64 `query:"requestId"`
+	Status       string `query:"status"`
+	Type         string `query:"type"`
+	DeliveryMode string `query:"deliveryMode"`
+	Recipient    string `query:"recipient"`
+	ErrorCode    string `query:"errorCode"`
 }
 
 func (r listMessagesRequest) validate() error {
@@ -249,6 +196,7 @@ func isMessageStatus(s string) bool {
 	return domain.MessageStatus(s).Valid()
 }
 
+// MessageFilter فیلتر داخلی برای کوئری لیست پیام‌ها است.
 type MessageFilter struct {
 	UserID       *int64
 	RequestID    *int64
@@ -259,40 +207,48 @@ type MessageFilter struct {
 	ErrorCode    string
 }
 
-// --- UseCase command / result ---
+// --- فرمان و نتیجهٔ UseCase ---
 
-type SendCommand struct {
+// SendMsgRequest فرمان داخلی ارسال (از OTP یا Text) است.
+type SendMsgRequest struct {
 	UserID         int64
 	IdempotencyKey string
-	OTPMessages    []OTPGroup
-	TextMessages   []TextGroup
+	OTP            *OTPPayload
+	Text           *TextPayload
 }
 
-type OTPGroup struct {
+// OTPPayload محتوای ارسال OTP است.
+type OTPPayload struct {
 	DeliveryMode string
 	Template     string
 	Recipients   []OTPRecipient
 }
 
+// OTPRecipient یک گیرنده OTP با متغیرهای قالب است.
 type OTPRecipient struct {
-	Mobile    string
-	Variables map[string]string
+	Mobile    string            `json:"mobile"`
+	Variables map[string]string `json:"variables"`
 }
 
-type TextGroup struct {
+// TextPayload محتوای ارسال پیام متنی است.
+type TextPayload struct {
 	DeliveryMode string
 	Text         string
 	Recipients   []string
 }
 
+// SendResult پاسخ استاندارد ارسال (هم HTTP و هم کش idempotency) است.
 type SendResult struct {
 	RequestID     int64           `json:"requestId"`
 	TotalCost     int64           `json:"totalCost"`
 	AcceptedCount int             `json:"acceptedCount"`
 	RejectedCount int             `json:"rejectedCount"`
-	Messages      []MessageResult `json:"messages"`
+	SkippedCount  int             `json:"skippedCount"`
+	Messages      []MessageResult `json:"messages"` // پذیرفته و صف‌شده
+	Skipped       []MessageResult `json:"skipped"`  // رد / موجودی ناکافی
 }
 
+// MessageResult خلاصهٔ وضعیت یک گیرنده در پاسخ ارسال است.
 type MessageResult struct {
 	ID           int64  `json:"id,omitempty"`
 	Recipient    string `json:"recipient"`

@@ -6,53 +6,122 @@ import (
 	"github.com/soheil/arvan/internal/messaging/domain"
 )
 
-const (
-	costOTP         int64 = 50
-	costTextNormal  int64 = 20
-	costTextExpress int64 = 30
-)
+// smsCost هزینهٔ یکنواخت هر پیامک (تومان).
+const smsCost int64 = 1
 
-func buildMessages(cmd SendCommand) []domain.Message {
-	var out []domain.Message
+// plannedSend نتیجهٔ برنامه‌ریزی ارسال قبل از persist و Kafka است.
+type plannedSend struct {
+	Payable       []domain.Message // پیام‌های قابل پذیرش (موجودی کافی)
+	Skipped       []MessageResult  // ردشده/ردشده به‌خاطر موجودی — فقط برای پاسخ API
+	TotalCost     int64            // تعداد پذیرفته‌شده × smsCost
+	RejectedCount int              // تعداد invalid (مثلاً موبایل نامعتبر)
+	SkippedCount  int              // تعداد insufficient_balance
+}
 
-	for _, group := range cmd.OTPMessages {
-		mode := domain.DeliveryMode(group.DeliveryMode)
-		for _, recipient := range group.Recipients {
-			out = append(out, buildOTPMessage(cmd.UserID, mode, group.Template, recipient))
+// planSend در یک پاس پیام‌ها را می‌سازد و payable/skipped را جدا می‌کند.
+// هزینه با ضرب (accepted × smsCost) حساب می‌شود، نه با جمع داخل لوپ.
+func planSend(req SendMsgRequest, available int64) plannedSend {
+	// حداکثر تعداد پیامی که با موجودی فعلی می‌توان پذیرفت
+	affordable := available / smsCost
+	if affordable < 0 {
+		affordable = 0
+	}
+
+	n := recipientCount(req)
+	// ظرفیت Payable + Skipped = تعداد کل گیرندگان درخواست
+	payableCap := int(min64(affordable, int64(n)))
+	out := plannedSend{
+		Payable: make([]domain.Message, 0, payableCap),
+		Skipped: make([]MessageResult, 0, n-payableCap),
+	}
+
+	var accepted int64
+
+	if req.OTP != nil {
+		for _, recipient := range req.OTP.Recipients {
+			planOne(
+				&out,
+				&accepted,
+				affordable,
+				buildOTPCandidate(req.UserID, req.OTP.Template, recipient),
+			)
 		}
 	}
 
-	for _, group := range cmd.TextMessages {
-		mode := domain.DeliveryMode(group.DeliveryMode)
-		for _, mobile := range group.Recipients {
-			out = append(out, buildTextMessage(cmd.UserID, mode, group.Text, mobile))
+	if req.Text != nil {
+		mode := domain.DeliveryMode(req.Text.DeliveryMode)
+		for _, mobile := range req.Text.Recipients {
+			planOne(
+				&out,
+				&accepted,
+				affordable,
+				buildTextCandidate(req.UserID, mode, req.Text.Text, mobile),
+			)
 		}
 	}
 
+	out.TotalCost = accepted * smsCost
 	return out
 }
 
-func buildOTPMessage(userID int64, mode domain.DeliveryMode, template string, recipient OTPRecipient) domain.Message {
-	if !isValidMobile(recipient.Mobile) {
-		return rejectedMessage(userID, recipient.Mobile, domain.MessageTypeOTP, mode, "", "invalid_mobile")
+// planOne یک نامزد را در payable یا skipped قرار می‌دهد.
+func planOne(out *plannedSend, accepted *int64, affordable int64, msg domain.Message) {
+	// قبلاً به‌خاطر اعتبارسنجی رد شده (مثلاً موبایل نامعتبر)
+	if msg.Status == domain.MessageRejected {
+		out.RejectedCount++
+		out.Skipped = append(out.Skipped, toMessageResult(&msg))
+		return
 	}
 
+	// هنوز ظرفیت موجودی داریم
+	if *accepted < affordable {
+		*accepted++
+		out.Payable = append(out.Payable, msg)
+		return
+	}
+
+	// موجودی کافی نیست — در پاسخ می‌آید ولی به DB/Kafka نمی‌رود
+	code := "insufficient_balance"
+	msg.Status = domain.MessageRejected
+	msg.ErrorCode = &code
+	msg.Cost = 0
+	out.SkippedCount++
+	out.Skipped = append(out.Skipped, toMessageResult(&msg))
+}
+
+// recipientCount تعداد کل گیرندگان درخواست را برمی‌گرداند.
+func recipientCount(req SendMsgRequest) int {
+	n := 0
+	if req.OTP != nil {
+		n += len(req.OTP.Recipients)
+	}
+	if req.Text != nil {
+		n += len(req.Text.Recipients)
+	}
+	return n
+}
+
+// buildOTPCandidate پیام OTP را به متن عادی (delivery=normal) تبدیل می‌کند.
+func buildOTPCandidate(userID int64, template string, recipient OTPRecipient) domain.Message {
+	if !isValidMobile(recipient.Mobile) {
+		return rejectedMessage(userID, recipient.Mobile, domain.MessageTypeText, domain.DeliveryNormal, "", "invalid_mobile")
+	}
 	return domain.Message{
 		UserID:       userID,
 		Recipient:    recipient.Mobile,
-		Type:         domain.MessageTypeOTP,
-		DeliveryMode: mode,
+		Type:         domain.MessageTypeText,
+		DeliveryMode: domain.DeliveryNormal,
 		Text:         renderTemplate(template, recipient.Variables),
 		Status:       domain.MessageAccepted,
-		Cost:         costOTP,
+		Cost:         smsCost,
 	}
 }
 
-func buildTextMessage(userID int64, mode domain.DeliveryMode, text, mobile string) domain.Message {
+// buildTextCandidate یک پیام متنی را برای گیرنده می‌سازد.
+func buildTextCandidate(userID int64, mode domain.DeliveryMode, text, mobile string) domain.Message {
 	if !isValidMobile(mobile) {
 		return rejectedMessage(userID, mobile, domain.MessageTypeText, mode, text, "invalid_mobile")
 	}
-
 	return domain.Message{
 		UserID:       userID,
 		Recipient:    mobile,
@@ -60,10 +129,11 @@ func buildTextMessage(userID int64, mode domain.DeliveryMode, text, mobile strin
 		DeliveryMode: mode,
 		Text:         text,
 		Status:       domain.MessageAccepted,
-		Cost:         textCost(mode),
+		Cost:         smsCost,
 	}
 }
 
+// rejectedMessage پیام ردشده برای پاسخ API (بدون هزینه) می‌سازد.
 func rejectedMessage(
 	userID int64,
 	recipient string,
@@ -80,16 +150,12 @@ func rejectedMessage(
 		Text:         text,
 		Status:       domain.MessageRejected,
 		ErrorCode:    &errCode,
+		Cost:         0,
 	}
 }
 
-func textCost(mode domain.DeliveryMode) int64 {
-	if mode == domain.DeliveryExpress {
-		return costTextExpress
-	}
-	return costTextNormal
-}
-
+// renderTemplate جایگذاری متغیرها در قالب OTP را انجام می‌دهد.
+// هم {{key}} و هم {key} پشتیبانی می‌شود.
 func renderTemplate(tmpl string, vars map[string]string) string {
 	out := tmpl
 	for key, value := range vars {
@@ -99,6 +165,7 @@ func renderTemplate(tmpl string, vars map[string]string) string {
 	return out
 }
 
+// isValidMobile موبایل را به‌صورت ساده (حداقل ۱۰ رقم عددی) اعتبارسنجی می‌کند.
 func isValidMobile(mobile string) bool {
 	mobile = strings.TrimSpace(mobile)
 	if len(mobile) < 10 {
@@ -112,19 +179,17 @@ func isValidMobile(mobile string) bool {
 	return true
 }
 
-func sumAcceptedCost(messages []domain.Message) int64 {
-	var total int64
-	for _, m := range messages {
-		if m.Status == domain.MessageAccepted {
-			total += m.Cost
-		}
+// kafkaTopic تاپیک مناسب بر اساس حالت ارسال را برمی‌گرداند.
+func kafkaTopic(mode domain.DeliveryMode, normal, express string) string {
+	if mode == domain.DeliveryExpress {
+		return express
 	}
-	return total
+	return normal
 }
 
-func outboxTopic(mode domain.DeliveryMode) string {
-	if mode == domain.DeliveryExpress {
-		return "sms.express"
+func min64(a, b int64) int64 {
+	if a < b {
+		return a
 	}
-	return "sms.normal"
+	return b
 }
