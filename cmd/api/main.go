@@ -6,6 +6,7 @@ import (
 	"github.com/labstack/echo/v4"
 	"github.com/labstack/echo/v4/middleware"
 
+	"github.com/soheil/arvan/docs"
 	"github.com/soheil/arvan/internal/messaging"
 	"github.com/soheil/arvan/internal/user"
 	"github.com/soheil/arvan/utils/config"
@@ -30,6 +31,7 @@ func main() {
 		return c.JSON(200, map[string]string{"status": "ok"})
 	})
 
+	docs.Register(e)
 	user.Register(e, sqlDB)
 	messaging.Register(e, sqlDB)
 
