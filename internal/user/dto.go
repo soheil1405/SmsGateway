@@ -7,10 +7,12 @@ import (
 	"github.com/soheil/arvan/utils/errs"
 )
 
+// addBalanceRequest بدنهٔ HTTP افزایش موجودی است.
 type addBalanceRequest struct {
 	Amount int64 `json:"amount"`
 }
 
+// validate مبلغ را بررسی می‌کند (باید بزرگ‌تر از صفر باشد).
 func (r addBalanceRequest) validate() error {
 	v := &errs.Validation{}
 	if r.Amount <= 0 {
@@ -19,6 +21,7 @@ func (r addBalanceRequest) validate() error {
 	return v.Err()
 }
 
+// userResponse شکل پاسخ HTTP برای موجودیت کاربر است.
 type userResponse struct {
 	ID        int64     `json:"id"`
 	Name      string    `json:"name"`
@@ -27,6 +30,7 @@ type userResponse struct {
 	UpdatedAt time.Time `json:"updatedAt"`
 }
 
+// toUserResponse دامنهٔ User را به پاسخ HTTP تبدیل می‌کند.
 func toUserResponse(u *domain.User) userResponse {
 	return userResponse{
 		ID:        u.ID,
@@ -37,6 +41,7 @@ func toUserResponse(u *domain.User) userResponse {
 	}
 }
 
+// AddBalanceCommand فرمان داخلی افزایش موجودی است.
 type AddBalanceCommand struct {
 	ID     int64
 	Amount int64

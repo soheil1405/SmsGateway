@@ -8,16 +8,20 @@ import (
 	"github.com/soheil/arvan/internal/user/domain"
 )
 
+// ErrNotFound وقتی کاربر در دیتابیس پیدا نشود برمی‌گردد.
 var ErrNotFound = errors.New("user not found")
 
+// Repo دسترسی به جدول users است.
 type Repo struct {
 	db *sql.DB
 }
 
+// NewRepo یک repository کاربر روی اتصال دیتابیس می‌سازد.
 func NewRepo(db *sql.DB) *Repo {
 	return &Repo{db: db}
 }
 
+// GetByID کاربر را با شناسه می‌خواند.
 func (r *Repo) GetByID(ctx context.Context, id int64) (*domain.User, error) {
 	u := &domain.User{}
 	err := r.db.QueryRowContext(ctx, `
@@ -33,6 +37,7 @@ func (r *Repo) GetByID(ctx context.Context, id int64) (*domain.User, error) {
 	return u, nil
 }
 
+// AddBalance موجودی را افزایش می‌دهد و رکورد به‌روزشده را برمی‌گرداند.
 func (r *Repo) AddBalance(ctx context.Context, id, amount int64) (*domain.User, error) {
 	u := &domain.User{}
 	err := r.db.QueryRowContext(ctx, `

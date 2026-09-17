@@ -6,20 +6,24 @@ import (
 	"github.com/soheil/arvan/utils/response"
 )
 
+// Handler لایهٔ HTTP ماژول کاربر است.
 type Handler struct {
 	uc *UseCase
 }
 
+// NewHandler هندلر کاربر را می‌سازد.
 func NewHandler(uc *UseCase) *Handler {
 	return &Handler{uc: uc}
 }
 
+// Register مسیرهای مربوط به کاربر را ثبت می‌کند.
 func (h *Handler) Register(e *echo.Echo) {
 	g := e.Group("/users")
 	g.GET("/:id", h.Get)
 	g.POST("/:id/add-balance", h.AddBalance)
 }
 
+// Get اطلاعات یک کاربر را برمی‌گرداند.
 func (h *Handler) Get(c echo.Context) error {
 	id, err := response.PathID(c, "id")
 	if err != nil {
@@ -34,6 +38,7 @@ func (h *Handler) Get(c echo.Context) error {
 	return response.OK(c, toUserResponse(user))
 }
 
+// AddBalance موجودی کاربر را افزایش می‌دهد.
 func (h *Handler) AddBalance(c echo.Context) error {
 	id, err := response.PathID(c, "id")
 	if err != nil {

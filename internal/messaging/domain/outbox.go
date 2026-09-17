@@ -5,14 +5,16 @@ import (
 	"time"
 )
 
+// OutboxStatus وضعیت انتشار رویداد outbox است.
 type OutboxStatus string
 
 const (
-	OutboxPending   OutboxStatus = "pending"
-	OutboxPublished OutboxStatus = "published"
-	OutboxFailed    OutboxStatus = "failed"
+	OutboxPending   OutboxStatus = "pending"   // منتظر انتشار
+	OutboxPublished OutboxStatus = "published" // منتشر شده
+	OutboxFailed    OutboxStatus = "failed"    // شکست در انتشار
 )
 
+// OutboxEvent رویداد قابل انتشار به صف پیام (الگوی transactional outbox) است.
 type OutboxEvent struct {
 	ID           int64
 	AggregateID  int64
