@@ -26,8 +26,11 @@ func newTestRedis(t *testing.T) *RedisStore {
 
 func deleteUserCascade(t *testing.T, db *sql.DB, userID int64) {
 	t.Helper()
+	_, _ = db.Exec(`
+		DELETE FROM outbox_events
+		WHERE aggregate_id IN (SELECT id FROM messages WHERE user_id = $1)
+	`, userID)
 	_, _ = db.Exec(`DELETE FROM messages WHERE user_id = $1`, userID)
-	_, _ = db.Exec(`DELETE FROM balance_reservations WHERE user_id = $1`, userID)
 	_, _ = db.Exec(`DELETE FROM requests WHERE user_id = $1`, userID)
 	_, _ = db.Exec(`DELETE FROM users WHERE id = $1`, userID)
 }
@@ -47,14 +50,15 @@ func loadIdempotentForTest(ctx context.Context, repo *Repo, redis *RedisStore, u
 	if err := json.Unmarshal(req.ResponseJSON, &result); err != nil {
 		return nil, false, err
 	}
-	_ = redis.SaveIdempotentResult(ctx, userID, key, &result)
+	_ = redis.SaveIdempotentResult(ctx, userID, key, req.PayloadHash, &result)
 	return &result, true, nil
 }
 
 // persistIdempotentOnce هستهٔ idempotent persist را بدون Kafka شبیه‌سازی می‌کند
 // (همان منطق usecase برای unique conflict → خواندن response_json).
 func persistIdempotentOnce(ctx context.Context, repo *Repo, redis *RedisStore, cmd SendMsgRequest) (*SendResult, error) {
-	if cached, ok, err := redis.GetIdempotentResult(ctx, cmd.UserID, cmd.IdempotencyKey); err == nil && ok {
+	hash := payloadHash(cmd)
+	if cached, ok, err := redis.GetIdempotentResult(ctx, cmd.UserID, cmd.IdempotencyKey, hash); err == nil && ok {
 		return cached, nil
 	}
 	if result, ok, err := loadIdempotentForTest(ctx, repo, redis, cmd.UserID, cmd.IdempotencyKey); err != nil {
@@ -82,6 +86,7 @@ func persistIdempotentOnce(ctx context.Context, repo *Repo, redis *RedisStore, c
 	req := &domain.Request{
 		UserID:         cmd.UserID,
 		IdempotencyKey: cmd.IdempotencyKey,
+		PayloadHash:    hash,
 		TotalCost:      planned.TotalCost,
 	}
 	if err := repo.CreateRequest(ctx, tx, req); err != nil {
@@ -129,7 +134,7 @@ func persistIdempotentOnce(ctx context.Context, repo *Repo, redis *RedisStore, c
 	if err := tx.Commit(); err != nil {
 		return nil, err
 	}
-	_ = redis.SaveIdempotentResult(ctx, cmd.UserID, cmd.IdempotencyKey, result)
+	_ = redis.SaveIdempotentResult(ctx, cmd.UserID, cmd.IdempotencyKey, hash, result)
 	return result, nil
 }
 
@@ -174,7 +179,7 @@ func TestIdempotency_RedisMiss_LoadsFromPostgres(t *testing.T) {
 		t.Fatalf("update response_json: %v", err)
 	}
 
-	uc := NewUseCase(repo, redisStore, nil)
+	uc := NewUseCase(repo, redisStore, "sms.normal", "sms.express", nil)
 	// Send با redis miss باید از Postgres بخواند و به Kafka نرسد
 	got, err := uc.Send(ctx, SendMsgRequest{
 		UserID:         userID,
@@ -198,7 +203,15 @@ func TestIdempotency_RedisMiss_LoadsFromPostgres(t *testing.T) {
 	}
 
 	// باید در Redis دوباره cache شده باشد
-	cached, ok, err := redisStore.GetIdempotentResult(ctx, userID, "abc")
+	hash := payloadHash(SendMsgRequest{
+		UserID: userID,
+		Text: &TextPayload{
+			DeliveryMode: "normal",
+			Text:         "hi",
+			Recipients:   []string{"09120000001", "09120000002"},
+		},
+	})
+	cached, ok, err := redisStore.GetIdempotentResult(ctx, userID, "abc", hash)
 	if err != nil || !ok {
 		t.Fatalf("expected redis recache, ok=%v err=%v", ok, err)
 	}

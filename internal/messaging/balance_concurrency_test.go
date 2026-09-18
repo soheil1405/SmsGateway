@@ -32,9 +32,27 @@ func openTestDB(t *testing.T) *sql.DB {
 		t.Skipf("postgres unavailable (set TEST_DATABASE_URL or start docker-compose): %v", err)
 	}
 
+	ensureTestSchema(t, db)
+
 	db.SetMaxOpenConns(40)
 	t.Cleanup(func() { _ = db.Close() })
 	return db
+}
+
+// ensureTestSchema migrationهای لازم برای volumeهای از قبل ساخته‌شده را اعمال می‌کند.
+func ensureTestSchema(t *testing.T, db *sql.DB) {
+	t.Helper()
+	stmts := []string{
+		`ALTER TABLE outbox_events DROP CONSTRAINT IF EXISTS outbox_events_status_check`,
+		`ALTER TABLE outbox_events ADD CONSTRAINT outbox_events_status_check CHECK (status IN ('pending', 'publishing', 'published', 'failed'))`,
+		`ALTER TABLE outbox_events ADD COLUMN IF NOT EXISTS locked_at TIMESTAMPTZ`,
+		`DROP TABLE IF EXISTS balance_reservations`,
+	}
+	for _, s := range stmts {
+		if _, err := db.Exec(s); err != nil {
+			t.Fatalf("ensure schema: %v\nstmt: %s", err, s)
+		}
+	}
 }
 
 func insertTestUser(t *testing.T, db *sql.DB, balance int64) int64 {
