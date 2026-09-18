@@ -84,24 +84,6 @@ func (r *Repo) UpdateRequestResponse(ctx context.Context, tx *sql.Tx, id int64, 
 	return err
 }
 
-// CreateReservation رزرو موجودی در جدول balance_reservations را ثبت می‌کند.
-func (r *Repo) CreateReservation(ctx context.Context, tx *sql.Tx, res *domain.BalanceReservation) error {
-	return tx.QueryRowContext(ctx, `
-		INSERT INTO balance_reservations (user_id, request_id, amount, status, expires_at)
-		VALUES ($1, $2, $3, $4, $5)
-		RETURNING id, created_at
-	`, res.UserID, res.RequestID, res.Amount, res.Status, res.ExpiresAt,
-	).Scan(&res.ID, &res.CreatedAt)
-}
-
-// CommitReservation وضعیت رزرو را از pending به committed می‌برد.
-func (r *Repo) CommitReservation(ctx context.Context, tx *sql.Tx, requestID int64) error {
-	_, err := tx.ExecContext(ctx, `
-		UPDATE balance_reservations SET status = $2 WHERE request_id = $1 AND status = $3
-	`, requestID, domain.ReservationCommitted, domain.ReservationPending)
-	return err
-}
-
 // CreateMessage یک پیام پذیرفته‌شده را در جدول messages درج می‌کند.
 func (r *Repo) CreateMessage(ctx context.Context, tx *sql.Tx, m *domain.Message) error {
 	return tx.QueryRowContext(ctx, `
@@ -120,6 +102,171 @@ func (r *Repo) CreateOutbox(ctx context.Context, tx *sql.Tx, e *domain.OutboxEve
 		RETURNING id, created_at
 	`, e.AggregateID, e.Topic, e.PartitionKey, e.Payload, e.Status,
 	).Scan(&e.ID, &e.CreatedAt)
+}
+
+// ClaimPendingOutbox یک batch را اتمیک از pending (یا publishing کهنه) به publishing می‌برد.
+// FOR UPDATE SKIP LOCKED جلوی پردازش موازی چند instance را می‌گیرد.
+func (r *Repo) ClaimPendingOutbox(ctx context.Context, limit int, staleAfter time.Duration) ([]domain.OutboxEvent, error) {
+	if limit <= 0 {
+		limit = 50
+	}
+	if staleAfter <= 0 {
+		staleAfter = time.Minute
+	}
+
+	tx, err := r.db.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback()
+
+	rows, err := tx.QueryContext(ctx, `
+		WITH cte AS (
+			SELECT id
+			FROM outbox_events
+			WHERE status = $1
+			   OR (status = $2 AND locked_at < NOW() - make_interval(secs => $3))
+			ORDER BY id ASC
+			FOR UPDATE SKIP LOCKED
+			LIMIT $4
+		)
+		UPDATE outbox_events e
+		SET status = $2,
+		    locked_at = NOW(),
+		    attempts = e.attempts + 1
+		FROM cte
+		WHERE e.id = cte.id
+		RETURNING e.id, e.aggregate_id, e.topic, e.partition_key, e.payload,
+		          e.status, e.attempts, e.last_error, e.created_at, e.published_at
+	`, domain.OutboxPending, domain.OutboxPublishing, staleAfter.Seconds(), limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	out := make([]domain.OutboxEvent, 0, limit)
+	for rows.Next() {
+		e, err := scanOutboxEvent(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, e)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+// ListPendingOutbox رویدادهای منتظر انتشار را به ترتیب id برمی‌گرداند (عمدتاً تست/دیباگ).
+func (r *Repo) ListPendingOutbox(ctx context.Context, limit int) ([]domain.OutboxEvent, error) {
+	if limit <= 0 {
+		limit = 50
+	}
+	rows, err := r.db.QueryContext(ctx, `
+		SELECT id, aggregate_id, topic, partition_key, payload, status, attempts, last_error, created_at, published_at
+		FROM outbox_events
+		WHERE status = $1
+		ORDER BY id ASC
+		LIMIT $2
+	`, domain.OutboxPending, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	out := make([]domain.OutboxEvent, 0, limit)
+	for rows.Next() {
+		e, err := scanOutboxEvent(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, e)
+	}
+	return out, rows.Err()
+}
+
+// listPendingOutboxByUser فقط pendingهای مربوط به کاربر را برمی‌گرداند (تست).
+func (r *Repo) listPendingOutboxByUser(ctx context.Context, userID int64) ([]domain.OutboxEvent, error) {
+	rows, err := r.db.QueryContext(ctx, `
+		SELECT o.id, o.aggregate_id, o.topic, o.partition_key, o.payload, o.status, o.attempts, o.last_error, o.created_at, o.published_at
+		FROM outbox_events o
+		JOIN messages m ON m.id = o.aggregate_id
+		WHERE o.status = $1 AND m.user_id = $2
+		ORDER BY o.id ASC
+	`, domain.OutboxPending, userID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	out := make([]domain.OutboxEvent, 0)
+	for rows.Next() {
+		e, err := scanOutboxEvent(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, e)
+	}
+	return out, rows.Err()
+}
+
+type outboxScanner interface {
+	Scan(dest ...any) error
+}
+
+func scanOutboxEvent(row outboxScanner) (domain.OutboxEvent, error) {
+	var e domain.OutboxEvent
+	var lastErr sql.NullString
+	var publishedAt sql.NullTime
+	if err := row.Scan(
+		&e.ID, &e.AggregateID, &e.Topic, &e.PartitionKey, &e.Payload,
+		&e.Status, &e.Attempts, &lastErr, &e.CreatedAt, &publishedAt,
+	); err != nil {
+		return e, err
+	}
+	if lastErr.Valid {
+		s := lastErr.String
+		e.LastError = &s
+	}
+	if publishedAt.Valid {
+		t := publishedAt.Time
+		e.PublishedAt = &t
+	}
+	return e, nil
+}
+
+// MarkOutboxPublished وضعیت رویداد را بعد از publish موفق به published می‌برد.
+func (r *Repo) MarkOutboxPublished(ctx context.Context, id int64) error {
+	_, err := r.db.ExecContext(ctx, `
+		UPDATE outbox_events
+		SET status = $2, published_at = NOW(), last_error = NULL, locked_at = NULL
+		WHERE id = $1 AND status IN ($3, $4)
+	`, id, domain.OutboxPublished, domain.OutboxPending, domain.OutboxPublishing)
+	return err
+}
+
+// MarkOutboxFailed رویداد را پس از اتمام تلاش‌ها به failed می‌برد (دیگر claim نمی‌شود).
+func (r *Repo) MarkOutboxFailed(ctx context.Context, id int64, errMsg string) error {
+	_, err := r.db.ExecContext(ctx, `
+		UPDATE outbox_events
+		SET status = $2, last_error = $3, locked_at = NULL
+		WHERE id = $1 AND status IN ($4, $5)
+	`, id, domain.OutboxFailed, errMsg, domain.OutboxPending, domain.OutboxPublishing)
+	return err
+}
+
+// RecordOutboxFailure رویداد را به pending برمی‌گرداند تا دوباره claim شود.
+func (r *Repo) RecordOutboxFailure(ctx context.Context, id int64, errMsg string) error {
+	_, err := r.db.ExecContext(ctx, `
+		UPDATE outbox_events
+		SET status = $2, last_error = $3, locked_at = NULL
+		WHERE id = $1 AND status IN ($2, $4)
+	`, id, domain.OutboxPending, errMsg, domain.OutboxPublishing)
+	return err
 }
 
 // ListMessages پیام‌ها را با فیلترهای اختیاری برمی‌گرداند.
@@ -189,6 +336,80 @@ func (r *Repo) ListMessages(ctx context.Context, filter MessageFilter) ([]domain
 	return list, rows.Err()
 }
 
+// ClaimOutcome نتیجهٔ تلاش برای تصاحب پیام جهت ارسال است.
+type ClaimOutcome int
+
+const (
+	ClaimAcquired      ClaimOutcome = iota // تازه claim شد → باید ارسال شود
+	ClaimAlreadySent                       // قبلاً sent → offset را commit کن
+	ClaimAlreadyFailed                     // قبلاً failed → offset را commit کن
+	ClaimInFlight                          // در حال ارسال توسط worker دیگر → commit نکن
+	ClaimNotFound                          // پیام وجود ندارد → کنار بگذار
+)
+
+// ClaimMessageForSending پیام را از queued (یا sending کهنه) به sending می‌برد.
+func (r *Repo) ClaimMessageForSending(ctx context.Context, id int64, staleAfter time.Duration) (ClaimOutcome, error) {
+	res, err := r.db.ExecContext(ctx, `
+		UPDATE messages
+		SET status = $2, updated_at = NOW()
+		WHERE id = $1
+		  AND (
+		        status = $3
+		        OR (status = $2 AND updated_at < NOW() - make_interval(secs => $4))
+		      )
+	`, id, domain.MessageSending, domain.MessageQueued, staleAfter.Seconds())
+	if err != nil {
+		return ClaimNotFound, err
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return ClaimNotFound, err
+	}
+	if n > 0 {
+		return ClaimAcquired, nil
+	}
+
+	var status string
+	err = r.db.QueryRowContext(ctx, `SELECT status FROM messages WHERE id = $1`, id).Scan(&status)
+	if errors.Is(err, sql.ErrNoRows) {
+		return ClaimNotFound, nil
+	}
+	if err != nil {
+		return ClaimNotFound, err
+	}
+	switch domain.MessageStatus(status) {
+	case domain.MessageSent:
+		return ClaimAlreadySent, nil
+	case domain.MessageFailed:
+		return ClaimAlreadyFailed, nil
+	case domain.MessageSending:
+		return ClaimInFlight, nil
+	default:
+		// queued که همزمان claim نشده — یا وضعیت غیرمنتظره
+		return ClaimInFlight, nil
+	}
+}
+
+// MarkMessageSent وضعیت پیام را به sent تغییر می‌دهد.
+func (r *Repo) MarkMessageSent(ctx context.Context, id int64) error {
+	_, err := r.db.ExecContext(ctx, `
+		UPDATE messages
+		SET status = $2, error_code = NULL, updated_at = NOW()
+		WHERE id = $1
+	`, id, domain.MessageSent)
+	return err
+}
+
+// MarkMessageFailed وضعیت پیام را با کد خطا به failed تغییر می‌دهد.
+func (r *Repo) MarkMessageFailed(ctx context.Context, id int64, code string) error {
+	_, err := r.db.ExecContext(ctx, `
+		UPDATE messages
+		SET status = $2, error_code = $3, updated_at = NOW()
+		WHERE id = $1
+	`, id, domain.MessageFailed, code)
+	return err
+}
+
 // GetBalanceForUpdate موجودی کاربر را با قفل ردیف می‌خواند (داخل تراکنش ارسال).
 func (r *Repo) GetBalanceForUpdate(ctx context.Context, tx *sql.Tx, userID int64) (int64, error) {
 	var balance int64
@@ -222,11 +443,6 @@ func (r *Repo) DebitBalance(ctx context.Context, tx *sql.Tx, userID, amount int6
 		return ErrInsufficientBalance
 	}
 	return nil
-}
-
-// DefaultReservationExpiry زمان انقضای پیش‌فرض رزرو موجودی است.
-func DefaultReservationExpiry() time.Time {
-	return time.Now().Add(15 * time.Minute)
 }
 
 // isUniqueViolation تشخیص خطای یکتایی Postgres (کد 23505) است.

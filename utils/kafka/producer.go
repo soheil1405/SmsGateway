@@ -16,13 +16,14 @@ type Producer struct {
 	topics config.Kafka
 }
 
-// NewProducer یک Writer با تنظیمات پیش‌فرض پروژه می‌سازد.
+// NewProducer یک Writer با Hash balancer می‌سازد.
+// کلید پیام (partition key) باید recipient باشد تا ترتیب per-گیرنده حفظ شود.
 func NewProducer(cfg config.Kafka) *Producer {
 	return &Producer{
 		topics: cfg,
 		writer: &kafkago.Writer{
 			Addr:                   kafkago.TCP(cfg.Brokers...),
-			Balancer:               &kafkago.Hash{},
+			Balancer:               &kafkago.Hash{}, // پارتیشن بر اساس Key
 			RequiredAcks:           kafkago.RequireOne,
 			AllowAutoTopicCreation: true, // برای محیط توسعه تاپیک را خودکار بسازد
 			Async:                  false,
@@ -73,3 +74,11 @@ func (p *Producer) TopicNormal() string { return p.topics.TopicNormal }
 
 // TopicExpress نام تاپیک ارسال فوری را برمی‌گرداند.
 func (p *Producer) TopicExpress() string { return p.topics.TopicExpress }
+
+// TopicDLQ نام تاپیک dead-letter را برمی‌گرداند.
+func (p *Producer) TopicDLQ() string { return p.topics.TopicDLQ }
+
+// PublishDLQ پیام را به تاپیک DLQ می‌فرستد (کلید برای پارتیشن‌بندی یکسان با پیام اصلی).
+func (p *Producer) PublishDLQ(ctx context.Context, key string, value []byte) error {
+	return p.Publish(ctx, p.topics.TopicDLQ, key, value)
+}

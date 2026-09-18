@@ -2,66 +2,99 @@ package messaging
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"strconv"
+	"time"
 
 	"github.com/soheil/arvan/internal/messaging/domain"
 	"github.com/soheil/arvan/utils/errs"
-	"github.com/soheil/arvan/utils/kafka"
+	"github.com/soheil/arvan/utils/metrics"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel/trace"
 )
+
+const idempotencyPollAttempts = 5
+const idempotencyPollDelay = 20 * time.Millisecond
 
 // UseCase منطق کسب‌وکار ارسال و لیست پیام‌ها را مدیریت می‌کند.
 type UseCase struct {
-	repo  *Repo
-	redis *RedisStore
-	kafka *kafka.Producer
+	repo         *Repo
+	redis        *RedisStore
+	topicNormal  string
+	topicExpress string
+	metrics      *metrics.Counters
 }
 
 // NewUseCase یک نمونه UseCase با وابستگی‌های لازم می‌سازد.
-func NewUseCase(repo *Repo, redis *RedisStore, producer *kafka.Producer) *UseCase {
+func NewUseCase(repo *Repo, redis *RedisStore, topicNormal, topicExpress string, m *metrics.Counters) *UseCase {
+	if m == nil {
+		m = &metrics.Counters{}
+	}
 	return &UseCase{
-		repo:  repo,
-		redis: redis,
-		kafka: producer,
+		repo:         repo,
+		redis:        redis,
+		topicNormal:  topicNormal,
+		topicExpress: topicExpress,
+		metrics:      m,
 	}
 }
 
 // Send جریان ارسال پیامک:
-// ۱) کش Redis idempotency
+// ۱) کش Redis idempotency (با تطبیق payload hash)
 // ۲) در صورت miss → PostgreSQL (source of truth)
-// ۳) در غیر این صورت: قفل موجودی → plan → debit → ذخیره → Kafka
+// ۳) قفل موجودی → plan → debit → ذخیره request/messages/outbox
 func (uc *UseCase) Send(ctx context.Context, req SendMsgRequest) (*SendResult, error) {
-	if result, ok, err := uc.resolveIdempotent(ctx, req.UserID, req.IdempotencyKey); err != nil {
+	ctx, span := otel.Tracer("arvan/messaging").Start(ctx, "messaging.Send",
+		trace.WithAttributes(
+			attribute.Int64("user.id", req.UserID),
+			attribute.String("idempotency.key", req.IdempotencyKey),
+		),
+	)
+	defer span.End()
+
+	hash := payloadHash(req)
+
+	if result, ok, err := uc.resolveIdempotent(ctx, req.UserID, req.IdempotencyKey, hash); err != nil {
+		span.RecordError(err)
+		span.SetStatus(codes.Error, err.Error())
 		return nil, err
 	} else if ok {
+		uc.metrics.IncIdempotentHits(ctx, 1)
+		span.SetAttributes(attribute.Bool("idempotent.hit", true))
 		return result, nil
 	}
 
-	result, err := uc.persistAndPublish(ctx, req)
+	result, err := uc.persistSend(ctx, req, hash)
 	if err != nil {
+		span.RecordError(err)
+		span.SetStatus(codes.Error, err.Error())
 		return nil, err
 	}
 
-	// بهترین تلاش برای پر کردن کش؛ شکست Redis پاسخ موفق را خراب نمی‌کند
-	_ = uc.redis.SaveIdempotentResult(ctx, req.UserID, req.IdempotencyKey, result)
+	uc.metrics.IncSendAccepted(ctx, 1)
+	span.SetAttributes(
+		attribute.Int64("request.id", result.RequestID),
+		attribute.Int("accepted.count", result.AcceptedCount),
+		attribute.Int64("total.cost", result.TotalCost),
+	)
+	_ = uc.redis.SaveIdempotentResult(ctx, req.UserID, req.IdempotencyKey, hash, result)
 	return result, nil
 }
 
-// resolveIdempotent اول Redis (cache) و در صورت miss، PostgreSQL را چک می‌کند.
-// ok=true یعنی نتیجهٔ قبلی پیدا شد.
-func (uc *UseCase) resolveIdempotent(ctx context.Context, userID int64, key string) (*SendResult, bool, error) {
-	cached, ok, err := uc.redis.GetIdempotentResult(ctx, userID, key)
+func (uc *UseCase) resolveIdempotent(ctx context.Context, userID int64, key, hash string) (*SendResult, bool, error) {
+	cached, ok, err := uc.redis.GetIdempotentResult(ctx, userID, key, hash)
 	if err == nil && ok {
 		return cached, true, nil
 	}
-	// خطای Redis مثل miss تلقی می‌شود؛ Postgres منبع حقیقت است
-
-	return uc.loadIdempotentFromDB(ctx, userID, key)
+	return uc.loadIdempotentFromDB(ctx, userID, key, hash)
 }
 
-// loadIdempotentFromDB نتیجه را از response_json می‌خواند و در Redis دوباره cache می‌کند.
-func (uc *UseCase) loadIdempotentFromDB(ctx context.Context, userID int64, key string) (*SendResult, bool, error) {
+func (uc *UseCase) loadIdempotentFromDB(ctx context.Context, userID int64, key, hash string) (*SendResult, bool, error) {
 	req, err := uc.repo.FindRequestByIdempotency(ctx, userID, key)
 	if errors.Is(err, ErrNotFound) {
 		return nil, false, nil
@@ -69,6 +102,12 @@ func (uc *UseCase) loadIdempotentFromDB(ctx context.Context, userID int64, key s
 	if err != nil {
 		return nil, false, err
 	}
+
+	// همان کلید با بدنهٔ متفاوت → تعارض
+	if req.PayloadHash != "" && hash != "" && req.PayloadHash != hash {
+		return nil, false, errs.ErrConflict
+	}
+
 	if len(req.ResponseJSON) == 0 {
 		return nil, false, nil
 	}
@@ -78,18 +117,35 @@ func (uc *UseCase) loadIdempotentFromDB(ctx context.Context, userID int64, key s
 		return nil, false, err
 	}
 
-	_ = uc.redis.SaveIdempotentResult(ctx, userID, key, &result)
+	_ = uc.redis.SaveIdempotentResult(ctx, userID, key, req.PayloadHash, &result)
 	return &result, true, nil
 }
 
-// ListMessages پیام‌ها را با فیلتر اختیاری برمی‌گرداند.
+// waitIdempotentFromDB بعد از unique conflict منتظر پر شدن response_json می‌ماند.
+func (uc *UseCase) waitIdempotentFromDB(ctx context.Context, userID int64, key, hash string) (*SendResult, error) {
+	for i := 0; i < idempotencyPollAttempts; i++ {
+		result, ok, err := uc.loadIdempotentFromDB(ctx, userID, key, hash)
+		if err != nil {
+			return nil, err
+		}
+		if ok {
+			return result, nil
+		}
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-time.After(idempotencyPollDelay):
+		}
+	}
+	return nil, errs.ErrConflict
+}
+
 func (uc *UseCase) ListMessages(ctx context.Context, filter MessageFilter) ([]domain.Message, error) {
 	return uc.repo.ListMessages(ctx, filter)
 }
 
-// persistAndPublish موجودی را در Postgres قفل/کسر می‌کند، پیام‌های payable را ذخیره
-// و بعد از commit به Kafka می‌فرستد. skipped فقط در پاسخ می‌آید.
-func (uc *UseCase) persistAndPublish(ctx context.Context, cmd SendMsgRequest) (*SendResult, error) {
+// persistSend موجودی را قفل/کسر می‌کند و request + messages + outbox را در یک TX ذخیره می‌کند.
+func (uc *UseCase) persistSend(ctx context.Context, cmd SendMsgRequest, hash string) (*SendResult, error) {
 	tx, err := uc.repo.Begin(ctx)
 	if err != nil {
 		return nil, err
@@ -115,26 +171,18 @@ func (uc *UseCase) persistAndPublish(ctx context.Context, cmd SendMsgRequest) (*
 	req := &domain.Request{
 		UserID:         cmd.UserID,
 		IdempotencyKey: cmd.IdempotencyKey,
+		PayloadHash:    hash,
 		TotalCost:      planned.TotalCost,
 	}
 	if err := uc.repo.CreateRequest(ctx, tx, req); err != nil {
 		if errors.Is(err, ErrConflict) {
-			// TX جاری rollback می‌شود (debit هم لغو)؛ نتیجهٔ برنده از Postgres خوانده می‌شود
 			_ = tx.Rollback()
-			result, ok, e := uc.loadIdempotentFromDB(ctx, cmd.UserID, cmd.IdempotencyKey)
-			if e != nil {
-				return nil, e
-			}
-			if ok {
-				return result, nil
-			}
-			return nil, errs.ErrConflict
+			return uc.waitIdempotentFromDB(ctx, cmd.UserID, cmd.IdempotencyKey, hash)
 		}
 		return nil, err
 	}
 
 	accepted := make([]MessageResult, 0, len(planned.Payable))
-	kafkaBatch := make([]kafka.Message, 0, len(planned.Payable))
 	for i := range planned.Payable {
 		msg := &planned.Payable[i]
 		msg.RequestID = req.ID
@@ -146,6 +194,7 @@ func (uc *UseCase) persistAndPublish(ctx context.Context, cmd SendMsgRequest) (*
 		accepted = append(accepted, toMessageResult(msg))
 
 		payload, err := json.Marshal(map[string]any{
+			"eventType":    domain.OutboxEventTypeSMS,
 			"messageId":    msg.ID,
 			"requestId":    msg.RequestID,
 			"userId":       msg.UserID,
@@ -158,11 +207,17 @@ func (uc *UseCase) persistAndPublish(ctx context.Context, cmd SendMsgRequest) (*
 		if err != nil {
 			return nil, err
 		}
-		kafkaBatch = append(kafkaBatch, kafka.Message{
-			Topic: kafkaTopic(msg.DeliveryMode, uc.kafka.TopicNormal(), uc.kafka.TopicExpress()),
-			Key:   strconv.FormatInt(msg.ID, 10),
-			Value: payload,
-		})
+
+		outbox := &domain.OutboxEvent{
+			AggregateID:  msg.ID,
+			Topic:        kafkaTopic(msg.DeliveryMode, uc.topicNormal, uc.topicExpress),
+			PartitionKey: msg.Recipient, // ترتیب per-گیرنده در پارتیشن
+			Payload:      payload,
+			Status:       domain.OutboxPending,
+		}
+		if err := uc.repo.CreateOutbox(ctx, tx, outbox); err != nil {
+			return nil, err
+		}
 	}
 
 	result := &SendResult{
@@ -186,10 +241,6 @@ func (uc *UseCase) persistAndPublish(ctx context.Context, cmd SendMsgRequest) (*
 		return nil, err
 	}
 
-	if err := uc.kafka.PublishBatch(ctx, kafkaBatch); err != nil {
-		return nil, err
-	}
-
 	return result, nil
 }
 
@@ -207,4 +258,23 @@ func toMessageResult(msg *domain.Message) MessageResult {
 		item.ErrorCode = *msg.ErrorCode
 	}
 	return item
+}
+
+// payloadHash اثر انگشت بدنهٔ درخواست (بدون idempotency key) است.
+func payloadHash(cmd SendMsgRequest) string {
+	body := map[string]any{
+		"userId": cmd.UserID,
+	}
+	if cmd.OTP != nil {
+		body["otp"] = cmd.OTP
+	}
+	if cmd.Text != nil {
+		body["text"] = cmd.Text
+	}
+	raw, err := json.Marshal(body)
+	if err != nil {
+		return strconv.FormatInt(cmd.UserID, 10)
+	}
+	sum := sha256.Sum256(raw)
+	return hex.EncodeToString(sum[:])
 }

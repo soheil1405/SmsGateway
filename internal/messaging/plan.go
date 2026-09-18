@@ -112,7 +112,7 @@ func buildOTPCandidate(userID int64, template string, recipient OTPRecipient) do
 		Type:         domain.MessageTypeText,
 		DeliveryMode: domain.DeliveryNormal,
 		Text:         renderTemplate(template, recipient.Variables),
-		Status:       domain.MessageAccepted,
+		Status:       domain.MessageQueued,
 		Cost:         smsCost,
 	}
 }
@@ -128,7 +128,7 @@ func buildTextCandidate(userID int64, mode domain.DeliveryMode, text, mobile str
 		Type:         domain.MessageTypeText,
 		DeliveryMode: mode,
 		Text:         text,
-		Status:       domain.MessageAccepted,
+		Status:       domain.MessageQueued,
 		Cost:         smsCost,
 	}
 }
