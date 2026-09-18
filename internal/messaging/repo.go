@@ -106,7 +106,8 @@ func (r *Repo) CreateOutbox(ctx context.Context, tx *sql.Tx, e *domain.OutboxEve
 
 // ClaimPendingOutbox یک batch را اتمیک از pending (یا publishing کهنه) به publishing می‌برد.
 // FOR UPDATE SKIP LOCKED جلوی پردازش موازی چند instance را می‌گیرد.
-func (r *Repo) ClaimPendingOutbox(ctx context.Context, limit int, staleAfter time.Duration) ([]domain.OutboxEvent, error) {
+// اگر preferTopic خالی نباشد، رویدادهای آن تاپیک (مثلاً express) زودتر claim می‌شوند.
+func (r *Repo) ClaimPendingOutbox(ctx context.Context, limit int, staleAfter time.Duration, preferTopic string) ([]domain.OutboxEvent, error) {
 	if limit <= 0 {
 		limit = 50
 	}
@@ -126,7 +127,7 @@ func (r *Repo) ClaimPendingOutbox(ctx context.Context, limit int, staleAfter tim
 			FROM outbox_events
 			WHERE status = $1
 			   OR (status = $2 AND locked_at < NOW() - make_interval(secs => $3))
-			ORDER BY id ASC
+			ORDER BY CASE WHEN topic = $5 THEN 0 ELSE 1 END, id ASC
 			FOR UPDATE SKIP LOCKED
 			LIMIT $4
 		)
@@ -138,7 +139,7 @@ func (r *Repo) ClaimPendingOutbox(ctx context.Context, limit int, staleAfter tim
 		WHERE e.id = cte.id
 		RETURNING e.id, e.aggregate_id, e.topic, e.partition_key, e.payload,
 		          e.status, e.attempts, e.last_error, e.created_at, e.published_at
-	`, domain.OutboxPending, domain.OutboxPublishing, staleAfter.Seconds(), limit)
+	`, domain.OutboxPending, domain.OutboxPublishing, staleAfter.Seconds(), limit, preferTopic)
 	if err != nil {
 		return nil, err
 	}
@@ -204,6 +205,48 @@ func (r *Repo) MarkOutboxFailed(ctx context.Context, id int64, errMsg string) er
 		WHERE id = $1 AND status IN ($4, $5)
 	`, id, domain.OutboxFailed, errMsg, domain.OutboxPending, domain.OutboxPublishing)
 	return err
+}
+
+// FinalizeOutboxExhausted outbox را failed می‌کند، پیام queued/sending را failed می‌زند
+// و در صورت تغییر وضعیت، هزینه را به موجودی برمی‌گرداند (idempotent).
+func (r *Repo) FinalizeOutboxExhausted(ctx context.Context, outboxID, messageID int64, errMsg string) error {
+	tx, err := r.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	if _, err := tx.ExecContext(ctx, `
+		UPDATE outbox_events
+		SET status = $2, last_error = $3, locked_at = NULL
+		WHERE id = $1 AND status IN ($4, $5)
+	`, outboxID, domain.OutboxFailed, errMsg, domain.OutboxPending, domain.OutboxPublishing); err != nil {
+		return err
+	}
+
+	var userID, cost int64
+	err = tx.QueryRowContext(ctx, `
+		UPDATE messages
+		SET status = $2, error_code = $3, updated_at = NOW()
+		WHERE id = $1 AND status IN ($4, $5)
+		RETURNING user_id, cost
+	`, messageID, domain.MessageFailed, "outbox_exhausted",
+		domain.MessageQueued, domain.MessageSending,
+	).Scan(&userID, &cost)
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return err
+	}
+	if err == nil && cost > 0 {
+		if _, err := tx.ExecContext(ctx, `
+			UPDATE users
+			SET balance = balance + $2, updated_at = NOW()
+			WHERE id = $1
+		`, userID, cost); err != nil {
+			return err
+		}
+	}
+
+	return tx.Commit()
 }
 
 // RecordOutboxFailure رویداد را به pending برمی‌گرداند تا دوباره claim شود.

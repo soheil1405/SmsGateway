@@ -15,7 +15,7 @@ import (
 type sendOTPRequest struct {
 	UserID         string         `json:"userId"`
 	IdempotencyKey string         `json:"idempotencyKey"`
-	Type           string         `json:"type"` // express یا normal (در عمل OTP همیشه normal می‌شود)
+	Type           string         `json:"type"` // express یا normal
 	Template       string         `json:"template"`
 	Recipients     []OTPRecipient `json:"recipients"`
 }

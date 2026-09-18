@@ -38,12 +38,13 @@ func planSend(req SendMsgRequest, available int64) plannedSend {
 	var accepted int64
 
 	if req.OTP != nil {
+		mode := domain.DeliveryMode(req.OTP.DeliveryMode)
 		for _, recipient := range req.OTP.Recipients {
 			planOne(
 				&out,
 				&accepted,
 				affordable,
-				buildOTPCandidate(req.UserID, req.OTP.Template, recipient),
+				buildOTPCandidate(req.UserID, mode, req.OTP.Template, recipient),
 			)
 		}
 	}
@@ -101,16 +102,16 @@ func recipientCount(req SendMsgRequest) int {
 	return n
 }
 
-// buildOTPCandidate پیام OTP را به متن عادی (delivery=normal) تبدیل می‌کند.
-func buildOTPCandidate(userID int64, template string, recipient OTPRecipient) domain.Message {
+// buildOTPCandidate پیام OTP را با type=otp و deliveryMode درخواست می‌سازد.
+func buildOTPCandidate(userID int64, mode domain.DeliveryMode, template string, recipient OTPRecipient) domain.Message {
 	if !isValidMobile(recipient.Mobile) {
-		return rejectedMessage(userID, recipient.Mobile, domain.MessageTypeText, domain.DeliveryNormal, "", "invalid_mobile")
+		return rejectedMessage(userID, recipient.Mobile, domain.MessageTypeOTP, mode, "", "invalid_mobile")
 	}
 	return domain.Message{
 		UserID:       userID,
 		Recipient:    recipient.Mobile,
-		Type:         domain.MessageTypeText,
-		DeliveryMode: domain.DeliveryNormal,
+		Type:         domain.MessageTypeOTP,
+		DeliveryMode: mode,
 		Text:         renderTemplate(template, recipient.Variables),
 		Status:       domain.MessageQueued,
 		Cost:         smsCost,

@@ -159,6 +159,32 @@ func TestConsumer_ProviderFailureMarksFailed(t *testing.T) {
 	}
 }
 
+func TestConsumer_ContextCancelDoesNotMarkFailed(t *testing.T) {
+	db := openTestDB(t)
+	repo := NewRepo(db)
+	ctx := context.Background()
+
+	userID := insertTestUser(t, db, 5)
+	t.Cleanup(func() { deleteUserCascade(t, db, userID) })
+	messageID := seedQueuedMessage(t, db, userID, domain.DeliveryNormal)
+
+	processor := NewMessageProcessor(repo, canceledSender{}, nil, nil)
+	err := processor.Process(ctx, smsPayload(t, messageID, "normal"))
+	if !errors.Is(err, errRetryLater) {
+		t.Fatalf("err=%v, want errRetryLater", err)
+	}
+	status, code := messageStatus(t, db, messageID)
+	if status == string(domain.MessageFailed) {
+		t.Fatalf("status=failed code=%s; cancel/retryable must not finalize", code)
+	}
+}
+
+type canceledSender struct{}
+
+func (canceledSender) Send(ctx context.Context, _, _, _ string) error {
+	return context.Canceled
+}
+
 func TestConsumer_StaleSendingIsReclaimed(t *testing.T) {
 	db := openTestDB(t)
 	repo := NewRepo(db)

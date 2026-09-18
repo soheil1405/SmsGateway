@@ -142,6 +142,11 @@ func (p *MessageProcessor) Process(ctx context.Context, payload []byte) error {
 	}
 
 	if err := p.sendWithRetry(ctx, event); err != nil {
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			log.Printf("component=sms-consumer event=canceled message_id=%d err=%v", event.MessageID, err)
+			span.SetAttributes(attribute.String("outcome", "canceled"))
+			return errRetryLater
+		}
 		log.Printf("component=sms-consumer event=provider_failed message_id=%d err=%v", event.MessageID, err)
 		if markErr := p.repo.MarkMessageFailed(ctx, event.MessageID, "provider_error"); markErr != nil {
 			span.RecordError(markErr)
@@ -173,6 +178,9 @@ func (p *MessageProcessor) sendWithRetry(ctx context.Context, event smsEvent) er
 		last = p.sender.Send(ctx, idemKey, event.Recipient, event.Text)
 		if last == nil {
 			return nil
+		}
+		if errors.Is(last, context.Canceled) || errors.Is(last, context.DeadlineExceeded) {
+			return last
 		}
 		if attempt == maxProviderAttempts {
 			break

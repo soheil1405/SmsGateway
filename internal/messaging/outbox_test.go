@@ -2,6 +2,7 @@ package messaging
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -98,6 +99,22 @@ func countUserOutbox(t *testing.T, userID int64, status domain.OutboxStatus) int
 	`, userID, status).Scan(&n)
 	if err != nil {
 		t.Fatalf("count outbox: %v", err)
+	}
+	return n
+}
+
+func countUserOutboxAny(t *testing.T, userID int64) int {
+	t.Helper()
+	db := openTestDB(t)
+	var n int
+	err := db.QueryRow(`
+		SELECT COUNT(*)
+		FROM outbox_events o
+		JOIN messages m ON m.id = o.aggregate_id
+		WHERE m.user_id = $1
+	`, userID).Scan(&n)
+	if err != nil {
+		t.Fatalf("count outbox any: %v", err)
 	}
 	return n
 }
@@ -395,7 +412,7 @@ func TestOutbox_MaxAttemptsGoesToDLQ(t *testing.T) {
 
 	pub := &fakePublisher{fail: true}
 	dlq := &fakeDLQ{}
-	worker := NewOutboxWorker(repo, pub, dlq, time.Millisecond, 10, 2, nil)
+	worker := NewOutboxWorker(repo, pub, dlq, time.Millisecond, 10, 2, "sms.express", nil)
 
 	// claim#1 fail → pending؛ claim#2 fail با attempts>=2 → DLQ
 	for i := 0; i < 5; i++ {
@@ -416,5 +433,82 @@ func TestOutbox_MaxAttemptsGoesToDLQ(t *testing.T) {
 	}
 	if dlq.len() < 1 {
 		t.Fatal("expected DLQ publish")
+	}
+	if bal := readBalance(t, db, userID); bal != 2 {
+		t.Fatalf("balance=%d, want 2 (refund after outbox exhausted)", bal)
+	}
+	var status, errCode string
+	if err := db.QueryRow(`SELECT status, COALESCE(error_code,'') FROM messages WHERE user_id=$1`, userID).
+		Scan(&status, &errCode); err != nil {
+		t.Fatal(err)
+	}
+	if status != string(domain.MessageFailed) || errCode != "outbox_exhausted" {
+		t.Fatalf("message status=%s err=%s, want failed/outbox_exhausted", status, errCode)
+	}
+}
+
+func TestOutbox_ClaimPrefersExpressTopic(t *testing.T) {
+	db := openTestDB(t)
+	repo := NewRepo(db)
+	ctx := context.Background()
+
+	userID := insertTestUser(t, db, 10)
+	t.Cleanup(func() { deleteUserCascade(t, db, userID) })
+
+	suffix := time.Now().UnixNano()
+	normalTopic := fmt.Sprintf("test.normal.%d", suffix)
+	expressTopic := fmt.Sprintf("test.express.%d", suffix)
+
+	// اول normal، بعد express — با اولویت claim باید express زودتر بیاید
+	reqID := seedRequest(t, db, userID)
+	normalID := seedMessageRow(t, db, reqID, userID, domain.DeliveryNormal)
+	expressID := seedMessageRow(t, db, reqID, userID, domain.DeliveryExpress)
+	insertOutbox(t, db, normalID, normalTopic)
+	insertOutbox(t, db, expressID, expressTopic)
+
+	events, err := repo.ClaimPendingOutbox(ctx, 1, time.Minute, expressTopic)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(events) != 1 || events[0].Topic != expressTopic {
+		t.Fatalf("claimed=%v, want first %s", events, expressTopic)
+	}
+}
+
+func seedRequest(t *testing.T, db *sql.DB, userID int64) int64 {
+	t.Helper()
+	var id int64
+	err := db.QueryRow(`
+		INSERT INTO requests (user_id, idempotency_key, payload_hash, total_cost)
+		VALUES ($1, $2, 'h', 0) RETURNING id
+	`, userID, fmt.Sprintf("req-%d", time.Now().UnixNano())).Scan(&id)
+	if err != nil {
+		t.Fatalf("seed request: %v", err)
+	}
+	return id
+}
+
+func seedMessageRow(t *testing.T, db *sql.DB, reqID, userID int64, mode domain.DeliveryMode) int64 {
+	t.Helper()
+	var id int64
+	err := db.QueryRow(`
+		INSERT INTO messages (request_id, user_id, recipient, type, delivery_mode, text, status, cost)
+		VALUES ($1, $2, '09120000000', 'text', $3, 'x', 'queued', 1)
+		RETURNING id
+	`, reqID, userID, mode).Scan(&id)
+	if err != nil {
+		t.Fatalf("seed message: %v", err)
+	}
+	return id
+}
+
+func insertOutbox(t *testing.T, db *sql.DB, messageID int64, topic string) {
+	t.Helper()
+	_, err := db.Exec(`
+		INSERT INTO outbox_events (aggregate_id, topic, partition_key, payload, status)
+		VALUES ($1, $2, 'k', '{}', 'pending')
+	`, messageID, topic)
+	if err != nil {
+		t.Fatalf("seed outbox: %v", err)
 	}
 }

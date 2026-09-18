@@ -77,7 +77,7 @@ func Register(
 	return &Runtime{
 		Outbox: NewOutboxWorker(
 			repo, producer, producer,
-			500*time.Millisecond, 50, cfg.OutboxMaxAttempts, m,
+			500*time.Millisecond, 50, cfg.OutboxMaxAttempts, cfg.TopicExpress, m,
 		),
 		Consumer: NewSMSConsumer(
 			NewMessageProcessor(repo, &LogSender{}, producer, m),

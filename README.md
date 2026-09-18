@@ -23,8 +23,8 @@ HTTP Send
   → پاسخ API
 
 OutboxWorker
-  → claim (SKIP LOCKED) → Kafka(sms.express|sms.normal) → published
-  → بعد از N شکست → failed + sms.dlq
+  → claim (SKIP LOCKED، اولویت express) → Kafka(sms.express|sms.normal) → published
+  → بعد از N شکست → outbox+message failed + refund هزینه + sms.dlq
 
 SMSConsumer (دو lane جدا)
   → claim message(sending) → provider (idempotent key=messageId, retry×3)
@@ -64,9 +64,6 @@ SMSConsumer (دو lane جدا)
 | سرویس | آدرس |
 |--------|------|
 | Grafana UI | http://localhost:3000 (admin / admin) |
-| OTLP HTTP | `localhost:4318` |
-| OTLP gRPC | `localhost:4317` |
-| JSON counters داخل اپ | `GET http://localhost:8080/metrics` |
 
 ### چه چیزی instrument شده؟
 - **Traces**: همهٔ HTTPها + `messaging.Send` + `outbox.ProcessOnce` + `sms.Process`
@@ -75,8 +72,6 @@ SMSConsumer (دو lane جدا)
 ### Env
 ```bash
 OTEL_ENABLED=true
-OTEL_EXPORTER_OTLP_ENDPOINT=localhost:4318   # داخل compose: otel-lgtm:4318
-OTEL_INSECURE=true
 OTEL_SERVICE_NAME=arvan-api
 ```
 
@@ -87,7 +82,7 @@ OTEL_SERVICE_NAME=arvan-api
 | لایه | سیاست |
 |------|--------|
 | Provider | حداکثر ۳ تلاش با backoff؛ بعد `failed` + DLQ |
-| Outbox | حداکثر `OUTBOX_MAX_ATTEMPTS` (پیش‌فرض ۱۰)؛ بعد `failed` + DLQ |
+| Outbox | حداکثر `OUTBOX_MAX_ATTEMPTS`؛ بعد outbox+message `failed` + refund + DLQ |
 | Consumer `in_flight` | بدون commit + backoff (retry) |
 | Payload خراب | commit + DLQ (بدون retry بی‌فایده) |
 

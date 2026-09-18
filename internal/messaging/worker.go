@@ -23,13 +23,14 @@ type MessagePublisher interface {
 
 // OutboxWorker رویدادهای pending را claim می‌کند و به Kafka می‌فرستد.
 type OutboxWorker struct {
-	repo        *Repo
-	publisher   MessagePublisher
-	dlq         DLQPublisher
-	interval    time.Duration
-	batchSize   int
-	maxAttempts int
-	metrics     *metrics.Counters
+	repo         *Repo
+	publisher    MessagePublisher
+	dlq          DLQPublisher
+	interval     time.Duration
+	batchSize    int
+	maxAttempts  int
+	preferTopic  string // مثلاً sms.express — در claim اولویت دارد
+	metrics      *metrics.Counters
 }
 
 // NewOutboxWorker یک worker با سقف تلاش و DLQ می‌سازد.
@@ -39,6 +40,7 @@ func NewOutboxWorker(
 	dlq DLQPublisher,
 	interval time.Duration,
 	batchSize, maxAttempts int,
+	preferTopic string,
 	m *metrics.Counters,
 ) *OutboxWorker {
 	if interval <= 0 {
@@ -60,6 +62,7 @@ func NewOutboxWorker(
 		interval:    interval,
 		batchSize:   batchSize,
 		maxAttempts: maxAttempts,
+		preferTopic: preferTopic,
 		metrics:     m,
 	}
 }
@@ -87,7 +90,7 @@ func (w *OutboxWorker) ProcessOnce(ctx context.Context) error {
 	ctx, span := otel.Tracer("arvan/messaging").Start(ctx, "outbox.ProcessOnce")
 	defer span.End()
 
-	events, err := w.repo.ClaimPendingOutbox(ctx, w.batchSize, outboxClaimStaleAfter)
+	events, err := w.repo.ClaimPendingOutbox(ctx, w.batchSize, outboxClaimStaleAfter, w.preferTopic)
 	if err != nil {
 		span.RecordError(err)
 		span.SetStatus(codes.Error, err.Error())
@@ -149,10 +152,11 @@ func (w *OutboxWorker) deadLetter(ctx context.Context, e *domain.OutboxEvent, de
 			w.metrics.IncOutboxToDLQ(ctx, 1)
 		}
 	}
-	if err := w.repo.MarkOutboxFailed(ctx, e.ID, detail); err != nil {
-		log.Printf("component=outbox-worker event=mark_failed_status outbox_id=%d err=%v", e.ID, err)
+	if err := w.repo.FinalizeOutboxExhausted(ctx, e.ID, e.AggregateID, detail); err != nil {
+		log.Printf("component=outbox-worker event=finalize_exhausted_error outbox_id=%d err=%v", e.ID, err)
 		_ = w.repo.RecordOutboxFailure(ctx, e.ID, detail)
 		return
 	}
-	log.Printf("component=outbox-worker event=dead_letter outbox_id=%d attempts=%d", e.ID, e.Attempts)
+	log.Printf("component=outbox-worker event=dead_letter outbox_id=%d message_id=%d attempts=%d",
+		e.ID, e.AggregateID, e.Attempts)
 }

@@ -86,7 +86,7 @@ func Load() Config {
 		Database: Database{
 			URL:      os.Getenv("DATABASE_URL"),
 			Host:     env("DB_HOST", "localhost"),
-			Port:     env("DB_PORT", "5432"),
+			Port:     env("DB_PORT", "5433"),
 			User:     env("DB_USER", "postgres"),
 			Password: env("DB_PASSWORD", "postgres"),
 			Name:     env("DB_NAME", "arvan"),
