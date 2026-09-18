@@ -69,15 +69,6 @@ func (p *Producer) Close() error {
 	return p.writer.Close()
 }
 
-// TopicNormal نام تاپیک ارسال عادی را برمی‌گرداند.
-func (p *Producer) TopicNormal() string { return p.topics.TopicNormal }
-
-// TopicExpress نام تاپیک ارسال فوری را برمی‌گرداند.
-func (p *Producer) TopicExpress() string { return p.topics.TopicExpress }
-
-// TopicDLQ نام تاپیک dead-letter را برمی‌گرداند.
-func (p *Producer) TopicDLQ() string { return p.topics.TopicDLQ }
-
 // PublishDLQ پیام را به تاپیک DLQ می‌فرستد (کلید برای پارتیشن‌بندی یکسان با پیام اصلی).
 func (p *Producer) PublishDLQ(ctx context.Context, key string, value []byte) error {
 	return p.Publish(ctx, p.topics.TopicDLQ, key, value)

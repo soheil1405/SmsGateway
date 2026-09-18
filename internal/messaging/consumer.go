@@ -258,11 +258,6 @@ func NewSMSConsumer(
 	}
 }
 
-// Lanes پیکربندی lane‌ها را برمی‌گرداند.
-func (c *SMSConsumer) Lanes() []Lane {
-	return c.lanes
-}
-
 // Run تا لغو context، همهٔ workerهای هر دو lane را اجرا می‌کند.
 func (c *SMSConsumer) Run(ctx context.Context) {
 	var wg sync.WaitGroup

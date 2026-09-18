@@ -31,16 +31,6 @@ func OK(c echo.Context, data any) error {
 	return c.JSON(http.StatusOK, Envelope{Data: data})
 }
 
-// Created پاسخ موفق ۲۰۱ برمی‌گرداند.
-func Created(c echo.Context, data any) error {
-	return c.JSON(http.StatusCreated, Envelope{Data: data})
-}
-
-// NoContent پاسخ ۲۰۴ بدون بدنه برمی‌گرداند.
-func NoContent(c echo.Context) error {
-	return c.NoContent(http.StatusNoContent)
-}
-
 // Fail پاسخ خطا با کد HTTP و کد/پیام کسب‌وکار برمی‌گرداند.
 func Fail(c echo.Context, status int, code, message string, fields ...errs.Field) error {
 	body := ErrorBody{Code: code, Message: message}

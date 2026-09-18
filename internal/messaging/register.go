@@ -19,7 +19,6 @@ import (
 type Runtime struct {
 	Outbox   *OutboxWorker
 	Consumer *SMSConsumer
-	Metrics  *metrics.Counters
 
 	wg sync.WaitGroup
 }
@@ -35,11 +34,6 @@ func (r *Runtime) Start(ctx context.Context) {
 		defer r.wg.Done()
 		r.Consumer.Run(ctx)
 	}()
-}
-
-// Wait تا پایان workerها صبر می‌کند (بعد از cancel شدن context).
-func (r *Runtime) Wait() {
-	r.wg.Wait()
 }
 
 // Stop با timeout منتظر اتمام workerها می‌ماند.
@@ -81,7 +75,6 @@ func Register(
 	normalWorkers := capLaneWorkers(cfg.Brokers, cfg.TopicNormal, cfg.WorkersNormal)
 
 	return &Runtime{
-		Metrics: m,
 		Outbox: NewOutboxWorker(
 			repo, producer, producer,
 			500*time.Millisecond, 50, cfg.OutboxMaxAttempts, m,

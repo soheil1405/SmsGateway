@@ -16,7 +16,6 @@ type fakePublisher struct {
 	mu        sync.Mutex
 	published []publishedMsg
 	fail      bool
-	failOnce  bool
 	calls     int
 }
 
@@ -30,7 +29,7 @@ func (f *fakePublisher) Publish(ctx context.Context, topic, key string, value []
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.calls++
-	if f.fail || (f.failOnce && f.calls == 1) {
+	if f.fail {
 		return errors.New("kafka unavailable")
 	}
 	cp := make([]byte, len(value))
@@ -45,9 +44,33 @@ func (f *fakePublisher) count() int {
 	return len(f.published)
 }
 
+func listPendingOutboxByUser(ctx context.Context, repo *Repo, userID int64) ([]domain.OutboxEvent, error) {
+	rows, err := repo.db.QueryContext(ctx, `
+		SELECT o.id, o.aggregate_id, o.topic, o.partition_key, o.payload, o.status, o.attempts, o.last_error, o.created_at, o.published_at
+		FROM outbox_events o
+		JOIN messages m ON m.id = o.aggregate_id
+		WHERE o.status = $1 AND m.user_id = $2
+		ORDER BY o.id ASC
+	`, domain.OutboxPending, userID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	out := make([]domain.OutboxEvent, 0)
+	for rows.Next() {
+		e, err := scanOutboxEvent(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, e)
+	}
+	return out, rows.Err()
+}
+
 func processUserPending(t *testing.T, ctx context.Context, repo *Repo, pub MessagePublisher, userID int64) {
 	t.Helper()
-	events, err := repo.listPendingOutboxByUser(ctx, userID)
+	events, err := listPendingOutboxByUser(ctx, repo, userID)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -318,7 +341,7 @@ func TestOutbox_CrashBeforeMarkAllowsRepublish(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	events, err := repo.listPendingOutboxByUser(ctx, userID)
+	events, err := listPendingOutboxByUser(ctx, repo, userID)
 	if err != nil || len(events) == 0 {
 		t.Fatalf("pending events: %v len=%d", err, len(events))
 	}

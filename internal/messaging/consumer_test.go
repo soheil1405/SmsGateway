@@ -340,7 +340,7 @@ func TestConsumer_ExpressGetsMoreCapacityAndNormalKeepsMinimum(t *testing.T) {
 		Lane{Name: "normal", Topic: "sms.normal", GroupID: "g-normal", Workers: 0},
 	)
 
-	lanes := consumer.Lanes()
+	lanes := consumer.lanes
 	if len(lanes) != 2 {
 		t.Fatalf("lanes=%d, want 2", len(lanes))
 	}

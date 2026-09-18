@@ -6,7 +6,6 @@ import "time"
 type MessageType string
 
 const (
-	MessageTypeOTP  MessageType = "otp"
 	MessageTypeText MessageType = "text"
 )
 

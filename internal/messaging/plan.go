@@ -29,7 +29,7 @@ func planSend(req SendMsgRequest, available int64) plannedSend {
 
 	n := recipientCount(req)
 	// ظرفیت Payable + Skipped = تعداد کل گیرندگان درخواست
-	payableCap := int(min64(affordable, int64(n)))
+	payableCap := int(min(affordable, int64(n)))
 	out := plannedSend{
 		Payable: make([]domain.Message, 0, payableCap),
 		Skipped: make([]MessageResult, 0, n-payableCap),
@@ -187,9 +187,3 @@ func kafkaTopic(mode domain.DeliveryMode, normal, express string) string {
 	return normal
 }
 
-func min64(a, b int64) int64 {
-	if a < b {
-		return a
-	}
-	return b
-}

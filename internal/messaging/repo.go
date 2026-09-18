@@ -161,59 +161,6 @@ func (r *Repo) ClaimPendingOutbox(ctx context.Context, limit int, staleAfter tim
 	return out, nil
 }
 
-// ListPendingOutbox رویدادهای منتظر انتشار را به ترتیب id برمی‌گرداند (عمدتاً تست/دیباگ).
-func (r *Repo) ListPendingOutbox(ctx context.Context, limit int) ([]domain.OutboxEvent, error) {
-	if limit <= 0 {
-		limit = 50
-	}
-	rows, err := r.db.QueryContext(ctx, `
-		SELECT id, aggregate_id, topic, partition_key, payload, status, attempts, last_error, created_at, published_at
-		FROM outbox_events
-		WHERE status = $1
-		ORDER BY id ASC
-		LIMIT $2
-	`, domain.OutboxPending, limit)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-
-	out := make([]domain.OutboxEvent, 0, limit)
-	for rows.Next() {
-		e, err := scanOutboxEvent(rows)
-		if err != nil {
-			return nil, err
-		}
-		out = append(out, e)
-	}
-	return out, rows.Err()
-}
-
-// listPendingOutboxByUser فقط pendingهای مربوط به کاربر را برمی‌گرداند (تست).
-func (r *Repo) listPendingOutboxByUser(ctx context.Context, userID int64) ([]domain.OutboxEvent, error) {
-	rows, err := r.db.QueryContext(ctx, `
-		SELECT o.id, o.aggregate_id, o.topic, o.partition_key, o.payload, o.status, o.attempts, o.last_error, o.created_at, o.published_at
-		FROM outbox_events o
-		JOIN messages m ON m.id = o.aggregate_id
-		WHERE o.status = $1 AND m.user_id = $2
-		ORDER BY o.id ASC
-	`, domain.OutboxPending, userID)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-
-	out := make([]domain.OutboxEvent, 0)
-	for rows.Next() {
-		e, err := scanOutboxEvent(rows)
-		if err != nil {
-			return nil, err
-		}
-		out = append(out, e)
-	}
-	return out, rows.Err()
-}
-
 type outboxScanner interface {
 	Scan(dest ...any) error
 }
