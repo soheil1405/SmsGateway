@@ -12,6 +12,7 @@ services:
       - arvan_pgdata:/var/lib/postgresql/data
       - ./migrations/001_init.sql:/docker-entrypoint-initdb.d/001_init.sql:ro
       - ./migrations/002_seed_user.sql:/docker-entrypoint-initdb.d/002_seed.sql:ro
+      - ./migrations/003_outbox_claim_drop_reservations.sql:/docker-entrypoint-initdb.d/003_outbox_claim.sql:ro
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U postgres -d arvan"]
       interval: 5s
@@ -55,6 +56,25 @@ services:
       retries: 12
       start_period: 25s
 
+  # Grafana LGTM: Tempo (traces) + Prometheus (metrics) + Grafana UI — ورودی OTLP
+  otel-lgtm:
+    image: grafana/otel-lgtm:0.11.0
+    container_name: arvan-otel-lgtm
+    ports:
+      - "3000:3000"   # Grafana UI
+      - "4317:4317"   # OTLP gRPC
+      - "4318:4318"   # OTLP HTTP
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: admin
+    healthcheck:
+      # otel-lgtm writes /tmp/ready when LGTM stack is up (~12s). No wget in image.
+      test: ["CMD-SHELL", "test -f /tmp/ready"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+      start_period: 15s
+
   app:
     build: .
     image: arvan-api:local
@@ -73,12 +93,19 @@ services:
       KAFKA_BROKERS: "kafka:9092"
       KAFKA_TOPIC_NORMAL: "sms.normal"
       KAFKA_TOPIC_EXPRESS: "sms.express"
+      KAFKA_TOPIC_DLQ: "sms.dlq"
+      OTEL_ENABLED: "true"
+      OTEL_EXPORTER_OTLP_ENDPOINT: "otel-lgtm:4318"
+      OTEL_INSECURE: "true"
+      OTEL_SERVICE_NAME: "arvan-api"
     depends_on:
       postgres:
         condition: service_healthy
       redis:
         condition: service_healthy
       kafka:
+        condition: service_healthy
+      otel-lgtm:
         condition: service_healthy
 
 volumes:
