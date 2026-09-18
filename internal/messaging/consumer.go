@@ -77,9 +77,9 @@ type PayloadProcessor interface {
 
 // MessageProcessor پیام را ارسال و وضعیتش را در Postgres به‌روز می‌کند.
 type MessageProcessor struct {
-	repo   *Repo
-	sender SMSSender
-	dlq    DLQPublisher
+	repo    *Repo
+	sender  SMSSender
+	dlq     DLQPublisher
 	metrics *metrics.Counters
 }
 
