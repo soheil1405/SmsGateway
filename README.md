@@ -75,11 +75,13 @@ go run ./cmd/api
 - `POST /users/:id/add-balance` `{ "amount": 5000 }`
 
 ### Messages
-- `POST /messages/send`
+- `POST /messages/send/otp`
+- `POST /messages/send/text`
 - `GET /messages` — فیلتر اختیاری:
   - `userId`, `requestId`, `status`, `type`, `deliveryMode`, `recipient`, `errorCode`
 
 ### هزینه
-- OTP: 50
-- Text normal: 20
-- Text express: 30
+- همه پیامک‌ها: **۱ تومان**
+- اگر موجودی کم باشد، پیام‌ها به ترتیب پذیرفته می‌شوند و باقی در `skipped` برمی‌گردند
+- Idempotency و رزرو موجودی روی **Redis**
+- ارسال نهایی روی **Kafka** (`sms.normal` / `sms.express`)
