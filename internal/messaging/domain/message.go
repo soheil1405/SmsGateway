@@ -22,7 +22,7 @@ const (
 type MessageStatus string
 
 const (
-	MessageAccepted MessageStatus = "accepted" // پذیرفته در مرحلهٔ برنامه‌ریزی
+	MessageAccepted MessageStatus = "accepted" // سازگاری فیلتر/اسکیما؛ در flow جدید persist نمی‌شود
 	MessageQueued   MessageStatus = "queued"   // درج در DB و آمادهٔ انتشار
 	MessageSending  MessageStatus = "sending"  // در حال ارسال توسط worker
 	MessageSent     MessageStatus = "sent"     // ارسال موفق
